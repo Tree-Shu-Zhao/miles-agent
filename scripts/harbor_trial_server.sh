@@ -16,10 +16,12 @@
 #       rows; a line that is no JSON object — an old-format list of names, one per line — is a FATAL, as is a file
 #       without rows)
 #   --selftest <n>   after the up line, <n> /run requests at once (their tasks the config's task_names in turn), their
-#                    model endpoint a closed port of <host>: the sandboxes, the harness's install, the endpoint's
-#                    route, the verifier and the teardown, without a GPU. A HARBOR_SELFTEST_ANSWER line per answer,
-#                    then HARBOR_SELFTEST_PASS (every answer a reward; exit 0) or HARBOR_SELFTEST_FAIL (a FATAL, exit
-#                    1); the server is stopped either way
+#                    model a scripted endpoint on <host> whose every reply is one bash tool call of the submit command:
+#                    the sandboxes, the harness's install, the agent's route to its endpoint, one command, the verifier
+#                    and the teardown, without a GPU (not a closed port: a trial whose model call failed has no reward,
+#                    and the server answers it 500). A HARBOR_SELFTEST_ANSWER line per answer, then
+#                    HARBOR_SELFTEST_PASS (every answer a reward, its agent having asked the model; exit 0) or
+#                    HARBOR_SELFTEST_FAIL (a FATAL, exit 1); the server is stopped either way
 #   --dry-run        print HARBOR_TRIAL_SERVER_CONFIG (the config it would write) and `DRY_RUN trial_server: <argv>`,
 #                    exit 0: nothing started, nothing written (a missing file is a WARN)
 #   -h / --help      this text
@@ -242,17 +244,47 @@ echo "HARBOR_TRIAL_SERVER_UP url=$NEMO_GYM_URL $("$CURL" -s -m 10 --noproxy '*' 
 if [ "$SELFTEST" != 0 ]; then
   rc=0
   "$TS_PYTHON" - "$NEMO_GYM_URL" "$SELFTEST" "$CONFIG" <<'PY' || rc=$?
-import asyncio, json, sys, time
+import asyncio, http.server, json, sys, threading, time
 import httpx, yaml
 url, n, config = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 tasks = list(dict.fromkeys(yaml.safe_load(open(config, encoding="utf-8")).get("task_names") or []))
 if not tasks:
     sys.exit("FATAL: the selftest needs the config's task_names (a server of a whole dataset lists none)")
-# port 9 of the server's host: nothing listens, so the agent's route to it is refused at once
-endpoint = f"http://{httpx.URL(url).host}:9/v1"
+# the agents' model, on the server's host: every chat completion is one bash tool call of the submit command, so each
+# trial is graded; run <i> asks it at /run<i>/v1. Not a closed port: vanillux raises ModelCallError at its first
+# failed call, a trial without a reward, which the server answers 500 (miles_harbor.trial_server's docstring)
+SUBMIT = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+asked = set()
+
+class Model(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        request = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        asked.add(self.path.split("/")[1])
+        call = {"id": "selftest", "type": "function",
+                "function": {"name": "bash", "arguments": json.dumps({"command": SUBMIT})}}
+        reply = json.dumps({
+            "id": "selftest", "object": "chat.completion", "created": int(time.time()),
+            "model": request.get("model") or "model",
+            "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                "role": "assistant", "content": "THOUGHT: the selftest submits at once.", "tool_calls": [call]}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(reply)))
+        self.end_headers()
+        self.wfile.write(reply)
+
+    def log_message(self, *args):
+        pass
+
+host = httpx.URL(url).host
+model = http.server.ThreadingHTTPServer((host, 0), Model)
+threading.Thread(target=model.serve_forever, daemon=True).start()
+endpoint = f"http://{host}:{model.server_address[1]}"
 
 async def run(client, i, task):
-    body = {"instance_id": task, "max_episode_steps": 5, "policy_base_url": endpoint,
+    body = {"instance_id": task, "max_episode_steps": 5, "policy_base_url": f"{endpoint}/run{i}/v1",
             "responses_create_params": {"input": [], "max_output_tokens": 256}}
     t0 = time.monotonic()
     try:
@@ -260,18 +292,27 @@ async def run(client, i, task):
         status, answer = r.status_code, r.text
     except httpx.HTTPError as e:
         status, answer = 0, repr(e)
-    print(f"HARBOR_SELFTEST_ANSWER {i} {task} status={status} s={time.monotonic() - t0:.0f} {answer[-1500:]}", flush=True)
-    return status
+    try:
+        reward = json.loads(answer).get("reward") if status == 200 else None
+    except (ValueError, AttributeError):
+        reward = None
+    reached = f"run{i}" in asked
+    print(f"HARBOR_SELFTEST_ANSWER {i} {task} status={status} model={'asked' if reached else 'never asked'}"
+          f" s={time.monotonic() - t0:.0f} {answer[-1500:]}", flush=True)
+    # a reward graded without a model call proves no route to the endpoint: not a pass
+    return status, isinstance(reward, (int, float)) and reached
 
 async def main():
     async with httpx.AsyncClient(timeout=None) as client:
         return await asyncio.gather(*(run(client, i, tasks[i % len(tasks)]) for i in range(n)))
 
 t0 = time.monotonic()
-statuses = asyncio.run(main())
-ok = statuses.count(200)
+answers = asyncio.run(main())
+model.shutdown()
+ok = sum(passed for _, passed in answers)
+statuses = sorted({status for status, _ in answers})
 print(f"HARBOR_SELFTEST_{'PASS' if ok == n else 'FAIL'} {ok} of {n} answered a reward in {time.monotonic() - t0:.0f} s"
-      f" (statuses {sorted(set(statuses))}, {len(set(tasks[i % len(tasks)] for i in range(n)))} tasks)", flush=True)
+      f" (statuses {statuses}, {len(set(tasks[i % len(tasks)] for i in range(n)))} tasks)", flush=True)
 sys.exit(0 if ok == n else 1)
 PY
   [ "$rc" -eq 0 ] || { echo "FATAL: the selftest failed (HARBOR_SELFTEST_FAIL above, rc=$rc)"; exit 1; }

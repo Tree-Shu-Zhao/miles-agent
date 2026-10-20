@@ -475,6 +475,23 @@ async def test_a_run_that_raised_answers_500_even_with_its_tests_skipped(tmax, c
     assert record["infra"].startswith("ModelCallError")
 
 
+@pytest.mark.parametrize("rule", [True, False])
+async def test_a_model_call_failure_answers_500_never_a_reward(tmax, config, rule):
+    # vanillux's ModelCallError (its model server failed MODEL_CALL_ATTEMPTS calls): no reward, with or without TMax's
+    # rule; gym_bridge reports the 500 as run_transport_failed and the trainer drops the group (a selftest that points
+    # the agents at a closed port gets this answer too)
+    tmax.config = tmax.config.model_copy(update={"reward_requires_submit": rule})
+    FakeTrial.status = {"exit_status": "model_error", "steps": 0}
+    FakeTrial.result = harbor_result(reward=None, exception="ModelCallError")
+    transport = httpx.ASGITransport(app=make_app(tmax))
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as client:
+        answer = await client.post("/run", json=body())
+    assert answer.status_code == 500
+    assert answer.json()["detail"].endswith("ModelCallError: it broke it broke it broke ")
+    (record,) = records(config)
+    assert "reward" not in record and record["infra"].startswith("ModelCallError")
+
+
 async def test_an_agent_timeout_under_the_rule_scores_0(tmax):
     FakeTrial.status = {"exit_status": "cancelled", "steps": 40}
     FakeTrial.result = harbor_result(exception="AgentTimeoutError")

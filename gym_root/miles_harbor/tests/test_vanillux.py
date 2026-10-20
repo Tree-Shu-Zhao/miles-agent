@@ -1,10 +1,12 @@
 """miles_harbor.vanillux: TMax's harness against a fake OpenAI-compatible server (replies scripted per test, every
 request recorded) and a fake environment that runs each command with a real bash in a scratch root."""
 
+import asyncio
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -19,6 +21,7 @@ import miles_harbor.vanillux as vanillux  # noqa: E402
 from harbor.agents.factory import AgentFactory  # noqa: E402
 from harbor.models.agent.context import AgentContext  # noqa: E402
 from harbor.models.trial.config import AgentConfig  # noqa: E402
+from miles_harbor.harness_api import Outcome  # noqa: E402
 from miles_harbor.vanillux import (  # noqa: E402
     SUBMIT_MARKER,
     VanilluxAgent,
@@ -305,3 +308,36 @@ def test_harbor_loads_it_by_import_path_with_the_endpoint_env(tmp_path):
     # the endpoint is this process's, not exported into the sandbox's commands (Harbor's exec env is extra_env)
     assert agent.extra_env == {} and agent._get_env("OPENAI_BASE_URL") == "http://h:1/v1"
     assert not VanilluxAgent.ENDPOINT.in_sandbox
+
+
+@pytest.mark.parametrize("failure", ["status", "refused"])
+async def test_a_failing_model_server_ends_the_run_with_ModelCallError(tmp_path, root, monkeypatch, failure):
+    # no outcome to train on: after MODEL_CALL_ATTEMPTS failed calls the run raises (the trial server then answers
+    # 500, not a reward), its status saying so; "refused": a closed port, as a model server that is gone
+    sleeps = []
+
+    async def no_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(vanillux, "asyncio", SimpleNamespace(sleep=no_sleep, CancelledError=asyncio.CancelledError))
+    server = Server([503] * vanillux.MODEL_CALL_ATTEMPTS)
+    url = server.url
+    if failure == "refused":
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            url = f"http://127.0.0.1:{s.getsockname()[1]}/v1"
+    agent = VanilluxAgent(
+        logs_dir=tmp_path / "agent", model_name="model", extra_env={"OPENAI_BASE_URL": url, "OPENAI_API_KEY": "EMPTY"}
+    )
+    environment = Environment(root)
+    await agent.setup(environment)
+    with pytest.raises(vanillux.ModelCallError) as raised:
+        await agent.run("Do the task.", environment, AgentContext())
+    server.httpd.shutdown()
+    expected = {"status": "InternalServerError: Error code: 503", "refused": "APIConnectionError: Connection error."}
+    assert str(raised.value).startswith(expected[failure])
+    assert sleeps == [2.0, 4.0, 8.0]
+    assert len(server.requests) == (vanillux.MODEL_CALL_ATTEMPTS if failure == "status" else 0)
+    status = json.loads((tmp_path / "agent" / vanillux.STATUS_FILE).read_text())
+    assert (status["exit_status"], status["steps"], status["model_calls"]) == ("model_error", 0, 0)
+    assert VanilluxAgent.outcome(tmp_path / "agent") == Outcome("model_error", False, 0)
