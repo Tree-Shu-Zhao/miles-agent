@@ -844,7 +844,9 @@ def test_roots_default_under_the_repo_and_follow_the_wrapper_dirs(tmp_path):
     )
     rc, out = _bash(snippet, _env(tmp_path, LOCAL_ENV="/dev/null"))
     assert rc == 0, out
-    miles_root = "/root/miles" if Path("/root/miles").is_dir() else f"{REPO}/3rdparty/miles"
+    # the probe common.sh makes (`[ -d /root/miles ]`): a stat failure is "no". os.path.isdir swallows every OSError
+    # the way `[ -d ]` does; pathlib's is_dir() lets EACCES through (a 0700 /root, as on CI runners)
+    miles_root = "/root/miles" if os.path.isdir("/root/miles") else f"{REPO}/3rdparty/miles"
     assert (f"M={REPO}/models D={REPO}/data R={REPO}/results RUNS={REPO}/results/runs "
             f"TD={REPO}/models/torch_dist_v5 MR={miles_root} JOB=") in out
     assert re.search(r"JOB=\d+ PORT=8200 PORTS=\[6100 6200 6379 7100-7131 7200 8100 8200 8265 13141-13143\]", out)
