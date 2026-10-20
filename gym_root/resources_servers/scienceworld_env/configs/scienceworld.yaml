@@ -1,0 +1,65 @@
+# Top-level keys are INSTANCE names (what ServerRefs and CLI overrides
+# address); the nested key under the server-type section selects the
+# implementation directory. Kept identical (scienceworld_env) like alfworld_env.
+scienceworld_env:
+  resources_servers:
+    scienceworld_env:
+      entrypoint: app.py
+      domain: games
+      verified: false
+      description: ScienceWorld elementary-science text tasks - Gymnasium protocol; /reset loads
+        a task by run-body task_name + var_num (cookie-keyed session) into a worker process
+        holding one warm JVM, /step plays the first act tool call in the model turn (structured
+        command argument, no text parsing); dense reward = running-max score delta / 100 (episode
+        sum = TCOD task score), won = raw simulator completion; TTL sweeper evicts sessions
+        abandoned by aborted episodes.
+      # DO NOT set num_workers here: per-session state lives in this process
+      # (the server asserts num_workers in (None, 1) at startup).
+      #
+      # jar_path / java_home: "" = the scienceworld wheel's bundled jar and the
+      # java already on PATH. The training entry overrides both on the gym CLI
+      #   +scienceworld_env.resources_servers.scienceworld_env.jar_path=$SCIW_JAR
+      #   +scienceworld_env.resources_servers.scienceworld_env.java_home=$SCIW_JAVA_HOME
+      # so a run always serves the pinned TCOD jar (sha256 f4e1fdce...f0d7) on
+      # the configured JDK 17; these defaults only serve manual/local runs.
+      jar_path: ""
+      java_home: ""
+      java_opts: "-Xmx2g -Xms256m -Xss2m"
+      simplification: easy
+      env_step_limit: 100
+      max_episode_steps: 30
+      action_tool_name: act
+      max_obs_chars: 4096
+      max_admissible_commands: 60
+      # One warm JVM (~350 MB) per worker = max concurrent episodes; ~45 GB RSS
+      # on the node. A 512-rollout training wave (recipes/scienceworld/run.py)
+      # and the 274-row eval wave queue on slot_wait_timeout_s below; the training
+      # entry overrides this with SCIW_ENV_WORKERS.
+      env_workers: 128
+      env_call_timeout_s: 300.0
+      env_spawn_timeout_s: 180.0
+      # /reset waits for a free worker up to this long, then 503 (drop + resample).
+      slot_wait_timeout_s: 600.0
+      # Must exceed NEMO_GYM_RUN_TIMEOUT (1200 s in recipes/scienceworld/run.py).
+      session_ttl_s: 1800.0
+      sweep_interval_s: 60.0
+
+scienceworld_agent:
+  responses_api_agents:
+    env_loop_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: scienceworld_env
+      # Structural requirement of the base agent config; unused whenever the
+      # /run body carries policy_base_url (the Miles training path).
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      # Episode turn budget = MODEL CALLS; matches the env's max_episode_steps.
+      max_turns: 30
+      datasets:
+        - name: example
+          type: example
+          jsonl_fpath: resources_servers/scienceworld_env/data/example.jsonl
+          license: Apache 2.0

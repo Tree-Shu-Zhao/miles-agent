@@ -1,0 +1,35 @@
+[project]
+name = "scienceworld-env-server"
+version = "0.0.1"
+# nemo-gym's own pin. scienceworld 1.2.3 + py4j are pure-python wheels (the
+# simulator is a Java jar bundled in the scienceworld wheel; the JDK comes from
+# the training entry's pre_gym_scienceworld check).
+requires-python = ">= 3.13.14"
+dependencies = [
+    "nemo-gym[dev]",
+    "scienceworld==1.2.3",
+    "py4j==0.10.9.9",
+    # Shared session-Gymnasium base + process slots (gym_root/agent_utils).
+    "miles-agent-utils",
+]
+
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools >= 61", "setuptools-scm"]
+
+# Package name is scienceworld_env, NOT scienceworld: the server package must
+# not shadow the PyPI scienceworld dependency inside the same venv.
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["scienceworld_env"]
+
+# 3 levels up = repo root; Gym is the pinned submodule there. agent_utils is
+# the sibling overlay package (the venv builder installs it editable too, see
+# scripts/build_gym_venvs.sh; tests import it via conftest).
+[tool.uv.sources]
+nemo-gym = { path = "../../../3rdparty/Gym", editable = true}
+miles-agent-utils = { path = "../../agent_utils", editable = true }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

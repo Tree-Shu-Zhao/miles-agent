@@ -1,0 +1,8 @@
+# miles-agent public-tree gate allowlist: `path:regex # reason`; read by tests/test_no_site_literals.py for the USABILITY,
+# HW and CLU classes only. IDENTITY and DANGLING have no allowlist. Every entry must match at least one line and carry a reason.
+docs/cluster.md:. # D22: the scheduler-wrapper contract may use the scheduler words (sbatch/srun/scontrol/SLURM_/enroot/pyxis/.sqsh)
+examples/slurm/:. # D22: the minimal Slurm example
+.gitignore:^\*\. # ignore globs name the artifacts that must never enter the tree (the container image suffix among them)
+.github/workflows/ci.yml:-name # the shell lint job names the example wrapper's file extension
+scripts/build_gym_venvs.sh:aarch64 # the uname -m value the venv builder branches on; textworld has no linux-aarch64 wheel
+tests/test_scripts_sh.py:aarch64 # the uname -m value the venv builder branches on; textworld has no linux-aarch64 wheel

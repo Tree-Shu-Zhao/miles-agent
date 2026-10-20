@@ -1,0 +1,460 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shu Zhao <shuzhao.cs@gmail.com>
+Date: Thu, 15 Oct 2026 13:32:09 -0700
+Subject: [PATCH] feat: --fp32-lm-head scores the policy with chunked fp32
+ logits
+
+--sglang-enable-fp32-lm-head samples from fp32 logits, while Megatron's
+output layer rounds the trainer's logits to bf16, so the trainer scores a
+different distribution than the engines sampled. With --fp32-lm-head the
+model returns its final hidden states through Megatron's output_processor
+hook, and get_log_probs_and_entropy computes each response's log-probs from
+fp32 logits (bf16 hidden states x bf16 output weight, fp32 accumulation and
+output), --log-probs-chunk-size tokens at a time; the backward recomputes
+each chunk's logits and runs its matmuls in fp32 storage with TF32 math.
+No [tokens, vocab] logits of the whole micro-batch exist (fp32 logits of a
+69,632-token micro-batch over a 248,320-token vocabulary would be 69 GB).
+The entropy, when asked, is observed only (--entropy-coef 0). Megatron with
+TP 1 and CP 1.
+---
+ miles/backends/megatron_utils/model.py        |   6 +
+ .../training_utils/loss/hub/fp32_lm_head.py   | 153 ++++++++++++++++++
+ .../loss/hub/logit_processors.py              |  57 +++++++
+ miles/utils/arguments.py                      |  16 ++
+ .../training_utils/loss/test_fp32_lm_head.py  | 106 ++++++++++++
+ 5 files changed, 338 insertions(+)
+ create mode 100644 miles/backends/training_utils/loss/hub/fp32_lm_head.py
+ create mode 100644 tests/fast/backends/training_utils/loss/test_fp32_lm_head.py
+
+diff --git a/miles/backends/megatron_utils/model.py b/miles/backends/megatron_utils/model.py
+index ae613d244..aaee8787e 100644
+--- a/miles/backends/megatron_utils/model.py
++++ b/miles/backends/megatron_utils/model.py
+@@ -30,6 +30,7 @@ from miles.backends.megatron_utils.local_weight_checksum import dump_local_weigh
+ from miles.backends.megatron_utils.optimizer_state_reset import reset_optimizer_states
+ from miles.backends.training_utils.data.rollout import DataIterator, get_batch
+ from miles.backends.training_utils.data.sampling_mask import get_rollout_sampling_masks
++from miles.backends.training_utils.loss.hub import fp32_lm_head
+ from miles.backends.training_utils.loss.objective import loss_function
+ from miles.backends.training_utils.metrics.checks import check_grad_norm, check_kl
+ from miles.backends.training_utils.metrics.log_utils import (
+@@ -366,6 +367,7 @@ def forward_only(
+             loss_mask=batch["input_loss_masks"],
+             **(filter_keys(batch, ["witness_ids"]) if args.enable_witness else {}),
+             **(batch["multimodal_train_inputs"] if batch["multimodal_train_inputs"] is not None else {}),
++            **({"output_processor": fp32_lm_head.output_processor} if args.fp32_lm_head else {}),
+             fp32_output=fp32_output,
+         )
+ 
+@@ -506,6 +508,7 @@ def run_forward_backward_pass(
+ 
+         if return_schedule_plan:
+             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
++            assert not args.fp32_lm_head, "--fp32-lm-head is not supported with combined 1f1b (build_schedule_plan)"
+             assert not args.enable_witness, "Witness is not supported with combined 1f1b (build_schedule_plan)"
+             output_tensor = model.build_schedule_plan(
+                 input_ids=batch["tokens"],
+@@ -530,6 +533,9 @@ def run_forward_backward_pass(
+ 
+             if (x := batch["multimodal_train_inputs"]) is not None:
+                 forward_kwargs.update(x)
++            if args.fp32_lm_head:
++                # the hidden states instead of bf16 logits; the loss computes fp32 logits chunk by chunk
++                forward_kwargs["output_processor"] = fp32_lm_head.output_processor
+ 
+             output_tensor = model(
+                 **forward_kwargs, fp32_output=args.loss_type not in ("policy_loss", "sft_loss", "score_centering")
+diff --git a/miles/backends/training_utils/loss/hub/fp32_lm_head.py b/miles/backends/training_utils/loss/hub/fp32_lm_head.py
+new file mode 100644
+index 000000000..329087b23
+--- /dev/null
++++ b/miles/backends/training_utils/loss/hub/fp32_lm_head.py
+@@ -0,0 +1,153 @@
++"""Trainer-side FP32 LM head (``--fp32-lm-head``).
++
++``--sglang-enable-fp32-lm-head`` makes the engines sample from fp32 logits, while Megatron's output layer rounds the
++trainer's logits to bf16 (a spacing of 0.125 for logits in [16, 32)), so the trainer scores a different distribution
++than the one sampled. With this flag the model stops before its output layer (Megatron's ``output_processor`` hook
++hands back the final hidden states) and the log-probs are computed here, one chunk of tokens at a time: the chunk's
++logits in fp32 (bf16 hidden states x bf16 output weight, fp32 accumulation and output, which is what an fp32 head
++computes from bf16 activations and weights), their logsumexp, the sampled tokens' log-probs and, detached, the
++entropy. The backward recomputes each chunk's logits and runs its matmuls in fp32 storage with TF32 math, so no
++``[tokens, vocab]`` tensor of the whole micro-batch ever exists (fp32 logits of a 69,632-token micro-batch over
++Qwen3.5's 248,320-token vocabulary would be 69 GB, and their gradient as much again).
++
++Tensor and context parallelism stay at 1: the weight is the whole vocabulary and the hidden states the whole
++sequence.
++"""
++
++from contextlib import contextmanager
++
++import torch
++
++_STASH: dict[str, torch.Tensor] = {}
++
++
++def validate_fp32_lm_head_args(args) -> None:
++    """What --fp32-lm-head needs (miles_validate_args). The sampling-support check reads the flags themselves:
++    ``use_sampling_support_replay`` is derived from them later in miles_validate_args."""
++    assert args.train_backend == "megatron", "--fp32-lm-head is implemented for the Megatron backend"
++    assert getattr(args, "tensor_model_parallel_size", 1) == 1, "--fp32-lm-head needs TP 1"
++    assert getattr(args, "context_parallel_size", 1) == 1, "--fp32-lm-head needs CP 1"
++    assert not args.true_on_policy_mode, "--fp32-lm-head and --true-on-policy-mode both own the log-probs"
++    assert (
++        args.rollout_top_p >= 1.0 and args.rollout_top_k <= 0
++    ), "--fp32-lm-head does not apply the sampling-support masks of --rollout-top-p / --rollout-top-k"
++    assert args.entropy_coef == 0, "--fp32-lm-head computes the entropy detached: --entropy-coef must be 0"
++
++
++def output_processor(*, hidden_states: torch.Tensor, output_layer, output_weight, config, **_) -> torch.Tensor:
++    """Megatron ``GPTModel`` output hook: the final hidden states as ``[b, s, h]`` (the layout logits would have) in
++    place of the logits; the output weight (the tied embedding's when shared) goes to ``_STASH`` for the loss of the
++    same micro-batch."""
++    if getattr(config, "use_mup", False):
++        raise NotImplementedError("--fp32-lm-head does not apply MuP's logit scaling")
++    if getattr(output_layer, "sequence_parallel", False):
++        raise NotImplementedError("--fp32-lm-head needs the whole sequence on the rank (no sequence parallelism)")
++    _STASH["weight"] = output_weight if output_weight is not None else output_layer.weight
++    return hidden_states.transpose(0, 1)
++
++
++def take_output_weight() -> torch.Tensor:
++    weight = _STASH.get("weight")
++    if weight is None:
++        raise RuntimeError("--fp32-lm-head: no output weight from the model's forward (output_processor not passed?)")
++    return weight
++
++
++@contextmanager
++def _tf32_matmuls():
++    previous = torch.backends.cuda.matmul.allow_tf32
++    torch.backends.cuda.matmul.allow_tf32 = True
++    try:
++        yield
++    finally:
++        torch.backends.cuda.matmul.allow_tf32 = previous
++
++
++def _chunk_logits(hidden: torch.Tensor, weight: torch.Tensor, temperature: float) -> torch.Tensor:
++    if hidden.is_cuda and torch.version.hip is None:
++        logits = torch.mm(hidden, weight.t(), out_dtype=torch.float32)
++    else:  # no bf16-in/fp32-out mm (CPU, ROCm): the same products and fp32 sums from upcast inputs
++        logits = torch.mm(hidden.float(), weight.float().t())
++    if temperature != 1.0:
++        logits.div_(temperature)
++    return logits
++
++
++class _FP32HeadLogProbs(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, hidden, weight, tokens, chunk_size: int, temperature: float, with_entropy: bool):
++        n = hidden.size(0)
++        log_probs = hidden.new_empty(n, dtype=torch.float32)
++        lse = hidden.new_empty(n, dtype=torch.float32)
++        entropy = hidden.new_empty(n if with_entropy else 0, dtype=torch.float32)
++        for s in range(0, n, chunk_size):
++            e = min(s + chunk_size, n)
++            logits = _chunk_logits(hidden[s:e], weight, temperature)
++            lse_c = torch.logsumexp(logits, dim=-1)
++            lse[s:e] = lse_c
++            log_probs[s:e] = logits.gather(1, tokens[s:e, None]).squeeze(1) - lse_c
++            if with_entropy:
++                logits.sub_(lse_c[:, None])  # log p
++                p_log_p = logits.exp().mul_(logits)
++                entropy[s:e] = -p_log_p.sum(dim=-1)
++                del p_log_p
++            del logits
++        ctx.save_for_backward(hidden, weight, tokens, lse)
++        ctx.chunk_size = chunk_size
++        ctx.temperature = temperature
++        ctx.mark_non_differentiable(entropy)
++        return log_probs, entropy
++
++    @staticmethod
++    def backward(ctx, grad_log_probs, _grad_entropy):
++        hidden, weight, tokens, lse = ctx.saved_tensors
++        n = hidden.size(0)
++        need_hidden, need_weight = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
++        grad_hidden = torch.empty_like(hidden) if need_hidden else None
++        grad_weight = torch.zeros(weight.shape, dtype=torch.float32, device=weight.device) if need_weight else None
++        if grad_log_probs is None or n == 0:
++            return (
++                torch.zeros_like(hidden) if need_hidden else None,
++                grad_weight.to(weight.dtype) if need_weight else None,
++                None,
++                None,
++                None,
++                None,
++            )
++        grad_log_probs = grad_log_probs.float()
++        weight_fp32 = weight.float()
++        with _tf32_matmuls():
++            for s in range(0, n, ctx.chunk_size):
++                e = min(s + ctx.chunk_size, n)
++                g = _chunk_logits(hidden[s:e], weight, ctx.temperature)
++                # d log p(y) / d logits = onehot(y) - softmax, times the incoming gradient
++                g.sub_(lse[s:e, None]).exp_().mul_(-grad_log_probs[s:e, None])
++                g.scatter_add_(1, tokens[s:e, None], grad_log_probs[s:e, None])
++                if ctx.temperature != 1.0:
++                    g.div_(ctx.temperature)
++                if need_hidden:
++                    grad_hidden[s:e] = torch.mm(g, weight_fp32).to(hidden.dtype)
++                if need_weight:
++                    grad_weight.addmm_(g.t(), hidden[s:e].float())
++                del g
++        return grad_hidden, grad_weight.to(weight.dtype) if need_weight else None, None, None, None, None
++
++
++def log_probs_and_entropy(
++    hidden: torch.Tensor,
++    weight: torch.Tensor,
++    tokens: torch.Tensor,
++    *,
++    chunk_size: int,
++    temperature: float,
++    with_entropy: bool,
++) -> tuple[torch.Tensor, torch.Tensor | None]:
++    """Per-token ``log p(token)`` (``[R]``, fp32, differentiable in ``hidden`` and ``weight``) and, when asked, the
++    detached entropy, from a sample's response hidden states ``[R, h]`` and the output weight ``[V, h]``."""
++    if chunk_size <= 0:
++        chunk_size = 4096
++    hidden = hidden.to(weight.dtype)
++    log_probs, entropy = _FP32HeadLogProbs.apply(
++        hidden, weight, tokens.long(), chunk_size, float(temperature), with_entropy
++    )
++    return log_probs, (entropy if with_entropy else None)
+diff --git a/miles/backends/training_utils/loss/hub/logit_processors.py b/miles/backends/training_utils/loss/hub/logit_processors.py
+index 100ff22a2..8d99ab50a 100644
+--- a/miles/backends/training_utils/loss/hub/logit_processors.py
++++ b/miles/backends/training_utils/loss/hub/logit_processors.py
+@@ -8,6 +8,7 @@ from miles.backends.training_utils.data.context_parallel import (
+     get_logits_and_tokens_offset_with_cp,
+ )
+ from miles.backends.training_utils.data.sampling_mask import build_local_sampling_mask
++from miles.backends.training_utils.loss.hub import fp32_lm_head
+ from miles.backends.training_utils.loss.hub.math_utils import calculate_log_probs_and_entropy
+ from miles.backends.training_utils.loss.hub.score_centering import selected_log_probs_and_entropy
+ from miles.backends.training_utils.parallel import get_parallel_state
+@@ -240,6 +241,17 @@ def get_log_probs_and_entropy(
+                     f"sampling-mask length {len(sampling_mask)} != response length "
+                     f"{response_length} for sample {sample_index}"
+                 )
++    if args.fp32_lm_head:
++        return _fp32_head_log_probs_and_entropy(
++            logits,
++            args=args,
++            unconcat_tokens=unconcat_tokens,
++            total_lengths=total_lengths,
++            response_lengths=response_lengths,
++            max_seq_lens=max_seq_lens,
++            with_entropy=with_entropy,
++            entropy_requires_grad=entropy_requires_grad,
++        )
+     parallel_state = get_parallel_state()
+     log_probs_list = []
+     entropy_list = []
+@@ -314,6 +326,51 @@ def get_log_probs_and_entropy(
+     return res
+ 
+ 
++def _fp32_head_log_probs_and_entropy(
++    hidden_states: torch.Tensor,
++    *,
++    args: Namespace,
++    unconcat_tokens: list[torch.Tensor],
++    total_lengths: list[int],
++    response_lengths: list[int],
++    max_seq_lens: list[int] | None,
++    with_entropy: bool,
++    entropy_requires_grad: bool,
++) -> dict[str, list[torch.Tensor]]:
++    """``get_log_probs_and_entropy`` under --fp32-lm-head: the model returned its final hidden states ``[1, T, h]``
++    in place of the logits (fp32_lm_head.output_processor); each response's log-probs come from fp32 logits computed
++    a --log-probs-chunk-size chunk at a time (fp32_lm_head)."""
++    if with_entropy and entropy_requires_grad:
++        raise NotImplementedError("--fp32-lm-head computes the entropy detached: --entropy-coef must be 0")
++    weight = fp32_lm_head.take_output_weight()
++    log_probs_list = []
++    entropy_list = []
++    for hidden_chunk, tokens_chunk, _ in _iter_response_chunks(
++        hidden_states,
++        args=args,
++        unconcat_tokens=unconcat_tokens,
++        total_lengths=total_lengths,
++        response_lengths=response_lengths,
++        max_seq_lens=max_seq_lens,
++        include_response_indices=False,
++    ):
++        log_prob, entropy = fp32_lm_head.log_probs_and_entropy(
++            hidden_chunk,
++            weight,
++            tokens_chunk,
++            chunk_size=args.log_probs_chunk_size,
++            temperature=args.rollout_temperature,
++            with_entropy=with_entropy,
++        )
++        log_probs_list.append(log_prob)
++        if with_entropy:
++            entropy_list.append(entropy)
++    res = {"log_probs": log_probs_list}
++    if with_entropy:
++        res["entropy"] = entropy_list
++    return res
++
++
+ def get_values(
+     logits: torch.Tensor,
+     *,
+diff --git a/miles/utils/arguments.py b/miles/utils/arguments.py
+index 4b2430957..68d17de92 100644
+--- a/miles/utils/arguments.py
++++ b/miles/utils/arguments.py
+@@ -17,6 +17,7 @@ from miles.backends.megatron_utils.megatron_config import (
+ )
+ from miles.backends.sglang_utils.arguments import add_sglang_arguments, collect_eval_sglang_overrides
+ from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
++from miles.backends.training_utils.loss.hub.fp32_lm_head import validate_fp32_lm_head_args
+ from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_args
+ from miles.ray.specs.train import compute_trainer_ids, external_trainer_controller_addrs
+ from miles.rollout.checkpoint_eval import is_checkpoint_eval_fn
+@@ -569,6 +570,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+             parser.add_argument(
+                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
+             )
++            parser.add_argument(
++                "--fp32-lm-head",
++                action="store_true",
++                default=False,
++                help=(
++                    "Score the policy with fp32 logits (bf16 hidden states x bf16 output weight, fp32 accumulation "
++                    "and output), as --sglang-enable-fp32-lm-head samples: the model returns its final hidden "
++                    "states and the log-probs are computed --log-probs-chunk-size tokens at a time, the backward "
++                    "recomputing each chunk, so no full fp32 logits exist. Megatron, TP 1, CP 1; entropy only "
++                    "observed (--entropy-coef 0)."
++                ),
++            )
+             parser.add_argument(
+                 "--indep-dp",
+                 action="store_true",
+@@ -3274,6 +3287,9 @@ def miles_validate_args(args):
+     if args.recompute_logprobs_via_prefill:
+         assert args.true_on_policy_mode, "--recompute-logprobs-via-prefill requires --true-on-policy-mode"
+ 
++    if args.fp32_lm_head:
++        validate_fp32_lm_head_args(args)
++
+     if args.use_session_server not in (False, True, "v1", "v2"):
+         raise ValueError(
+             f"--use-session-server={args.use_session_server!r} is not a known session server "
+diff --git a/tests/fast/backends/training_utils/loss/test_fp32_lm_head.py b/tests/fast/backends/training_utils/loss/test_fp32_lm_head.py
+new file mode 100644
+index 000000000..dbec9ba16
+--- /dev/null
++++ b/tests/fast/backends/training_utils/loss/test_fp32_lm_head.py
+@@ -0,0 +1,106 @@
++"""--fp32-lm-head: the chunked log-probs, entropy and gradients equal plain fp32 autograd on the full logits."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from miles.backends.training_utils.loss.hub import fp32_lm_head
++
++# This module intentionally has no explicit CI registration call: modules under
++# tests/fast are implicitly assigned to the stage-a-cpu suite by the CI collector.
++
++
++def _reference(hidden, weight, tokens, temperature):
++    logits = hidden.float() @ weight.float().t() / temperature
++    log_p = torch.log_softmax(logits, dim=-1)
++    entropy = -(log_p.exp() * log_p).sum(dim=-1)
++    return log_p.gather(1, tokens[:, None]).squeeze(1), entropy
++
++
++@pytest.mark.parametrize("chunk_size", [1, 5, 7, 64])
++@pytest.mark.parametrize("temperature", [1.0, 0.7])
++def test_matches_fp32_autograd(chunk_size, temperature):
++    torch.manual_seed(0)
++    n, h, v = 23, 16, 97
++    hidden = (torch.randn(n, h) * 2).to(torch.bfloat16).requires_grad_()
++    weight = (torch.randn(v, h) * 2).to(torch.bfloat16).requires_grad_()
++    tokens = torch.randint(0, v, (n,))
++    upstream = torch.randn(n)
++
++    log_p, entropy = fp32_lm_head.log_probs_and_entropy(
++        hidden, weight, tokens, chunk_size=chunk_size, temperature=temperature, with_entropy=True
++    )
++    (log_p * upstream).sum().backward()
++
++    hidden_ref = hidden.detach().float().requires_grad_()
++    weight_ref = weight.detach().float().requires_grad_()
++    log_p_ref, entropy_ref = _reference(hidden_ref, weight_ref, tokens, temperature)
++    (log_p_ref * upstream).sum().backward()
++
++    assert log_p.dtype == torch.float32
++    torch.testing.assert_close(log_p, log_p_ref, rtol=1e-5, atol=1e-5)
++    torch.testing.assert_close(entropy, entropy_ref.detach(), rtol=1e-5, atol=1e-5)
++    assert not entropy.requires_grad
++    # the gradients come back in the parameters' bf16
++    torch.testing.assert_close(hidden.grad.float(), hidden_ref.grad, rtol=2e-2, atol=2e-2)
++    torch.testing.assert_close(weight.grad.float(), weight_ref.grad, rtol=2e-2, atol=2e-2)
++
++
++def test_entropy_off_and_empty_response():
++    weight = torch.randn(11, 4).to(torch.bfloat16).requires_grad_()
++    hidden = torch.randn(0, 4).to(torch.bfloat16).requires_grad_()
++    log_p, entropy = fp32_lm_head.log_probs_and_entropy(
++        hidden, weight, torch.zeros(0, dtype=torch.long), chunk_size=4, temperature=1.0, with_entropy=False
++    )
++    assert log_p.shape == (0,) and entropy is None
++    log_p.sum().backward()
++    assert weight.grad is not None and torch.count_nonzero(weight.grad) == 0
++
++
++def _args(**overrides):
++    # as miles_validate_args sees them: before use_sampling_support_replay is derived
++    values = dict(
++        train_backend="megatron",
++        tensor_model_parallel_size=1,
++        context_parallel_size=1,
++        true_on_policy_mode=False,
++        rollout_top_p=1.0,
++        rollout_top_k=-1,
++        entropy_coef=0.0,
++    )
++    return SimpleNamespace(**(values | overrides))
++
++
++def test_validate_args_reads_the_sampling_flags_not_the_derived_replay_flag():
++    fp32_lm_head.validate_fp32_lm_head_args(_args())
++    for bad in (
++        dict(rollout_top_p=0.95, rollout_top_k=20),
++        dict(rollout_top_k=20),
++        dict(tensor_model_parallel_size=2),
++        dict(true_on_policy_mode=True),
++        dict(entropy_coef=0.01),
++        dict(train_backend="fsdp"),
++    ):
++        with pytest.raises(AssertionError):
++            fp32_lm_head.validate_fp32_lm_head_args(_args(**bad))
++
++
++def test_output_processor_returns_hidden_states_and_stashes_the_weight():
++    hidden = torch.randn(5, 1, 4)  # [s, b, h]
++    shared = torch.randn(9, 4)
++
++    class _Layer:
++        weight = torch.randn(9, 4)
++        sequence_parallel = False
++
++    class _Config:
++        use_mup = False
++
++    out = fp32_lm_head.output_processor(
++        hidden_states=hidden, output_layer=_Layer(), output_weight=shared, config=_Config(), labels=None
++    )
++    assert out.shape == (1, 5, 4)
++    assert fp32_lm_head.take_output_weight() is shared
++    fp32_lm_head.output_processor(hidden_states=hidden, output_layer=_Layer(), output_weight=None, config=_Config())
++    assert fp32_lm_head.take_output_weight() is _Layer.weight

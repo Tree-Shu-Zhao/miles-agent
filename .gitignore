@@ -1,0 +1,36 @@
+__pycache__/
+*.pyc
+.venv/
+# repo-root data/ only (recipe prepare_data outputs); per-server data dirs keep
+# their own .gitignore so tiny committed fixtures (wiki_search example.jsonl) survive
+/data/
+results/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+gym_root/env.yaml
+# per-server projects are venv'd by scripts/build_gym_venvs.sh (uv pip, no lock);
+# only the root project keeps a committed lock
+gym_root/**/uv.lock
+.DS_Store
+# the knob file, the prebuilt gym venvs, the models and the pid files of a plain machine
+# (scripts/lib/common.sh; scripts/build_gym_venvs.sh writes under /.gym_venvs/ by default)
+/local.env
+/.gym_venvs/
+/models/
+.pids/
+# runs, scratch and secrets never enter the tree (results/ models/ data/ local.env .gym_venvs/ .pids/ are above)
+outputs/
+reports/
+runs/
+wandb/
+.claude/
+.codex/
+*.log
+*.sqsh
+*.tar
+*.ckpt
+*.safetensors
+.env
+# the wandb entity and view ids of tools/wandb_core_view.py live in this untracked file
+tools/wandb_views.local.json

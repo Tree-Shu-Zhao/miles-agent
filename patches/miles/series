@@ -1,0 +1,12 @@
+# patches/miles/series — the miles patches in the order they apply on the pinned upstream base, one file name per
+# line. The order is binding (scripts/check_patches.sh --apply and the README's `git am` recipe follow it):
+# miles-fp32-lm-head.patch must precede miles-fp32-lm-head-hybrid.patch, which the two after it build on.
+miles-env-metrics.patch
+miles-reward-key-none-safe.patch
+miles-save-while-resident.patch
+miles-session-text-parts.patch
+miles-preempt-save.patch
+miles-fp32-lm-head.patch
+miles-fp32-lm-head-hybrid.patch
+miles-mamba-packed-seq-idx.patch
+miles-qwen3.5-2B-model-args.patch

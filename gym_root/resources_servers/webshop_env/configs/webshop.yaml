@@ -1,0 +1,81 @@
+# Top-level keys are INSTANCE names (what ServerRefs and CLI overrides
+# address); the nested key under the server-type section selects the
+# implementation directory. Kept identical (webshop_env) like wiki_search.
+webshop_env:
+  resources_servers:
+    webshop_env:
+      entrypoint: app.py
+      domain: agent
+      verified: false
+      description: WebShop text shopping tasks - Gymnasium protocol; /reset loads a goal
+        by run-body goal_id (the goal's content id, agent_utils/webshop_goals.py; an id the
+        engine does not have is a 400 = dataset/engine goal-set mismatch) or legacy task_id
+        (engine list index), /step plays the first act tool call in the model turn
+        (structured command argument, no text parsing); reward is the raw WebShop score at
+        click[buy now]; TCOD-protocol page/error wording; a thin proxy over the py3.10
+        engine server (env_servers/webshop).
+      # DO NOT set num_workers here: per-session episode handle lives in this
+      # process (the server asserts num_workers in (None, 1) at startup).
+      #
+      # Engine URL: loopback + a port below a 9000+ ephemeral range (a common
+      # ip_local_port_range on big nodes). The shell-side source of truth
+      # is env_servers/webshop/defaults.sh (WEBSHOP_SERVER_PORT); the training
+      # entry overrides this value on the gym CLI with
+      #   +webshop_env.resources_servers.webshop_env.engine_base_url=$WEBSHOP_ENGINE_BASE_URL
+      # so this default only serves manual/local runs.
+      engine_base_url: http://127.0.0.1:6200
+      # Protocol knobs (TCOD defaults). Both must agree with the engine tier;
+      # the training entry derives them from WEBSHOP_OBS_MODE /
+      # WEBSHOP_INVALID_FEEDBACK (env_servers/webshop/defaults.sh) and passes
+      #   +webshop_env.resources_servers.webshop_env.observation_mode=...
+      #   +webshop_env.resources_servers.webshop_env.invalid_action_feedback=...
+      # observation_mode: text_rich (TCOD / original WebShop: one text per line,
+      # [button] X [button_]) | text (verl-agent [SEP] form).
+      observation_mode: text_rich
+      # invalid_action_feedback: error (TCOD: non-admissible command spends the
+      # turn, engine not stepped, TCOD error sentence shown) | noop (forwarded;
+      # WebShop's unchanged page is the feedback — wstrain1/2 behavior).
+      invalid_action_feedback: error
+      max_episode_steps: 15
+      action_tool_name: act
+      max_obs_chars: 2048
+      max_admissible_commands: 60
+      # Caps in-flight engine calls from this adapter; the engine's own
+      # engine_workers is the real parallelism knob.
+      max_concurrency: 256
+      # Coupling rule: adapter timeout > engine --engine-call-timeout (120 s)
+      # + worker-respawn margin (kill/join <= 5 s + replacement-engine boot),
+      # so a wedged engine worker normally reaches this adapter as the
+      # engine's definitive 410/500 rather than a ReadTimeout on the
+      # non-idempotent /step. Holds while a replacement boots within ~115 s
+      # (--small); with --full raise this or lower --engine-call-timeout. The
+      # outcome is the same 502 -> group dropped either way.
+      engine_timeout_s: 240.0
+      # Coupling rule: NEMO_GYM_RUN_TIMEOUT (1200 s, recipes/webshop/run.py)
+      # < this adapter TTL < engine --session-ttl (2400 s): a live episode is
+      # never evicted mid-run, and the engine never evicts a session this
+      # adapter still considers live.
+      session_ttl_s: 1800.0
+      sweep_interval_s: 60.0
+
+webshop_agent:
+  responses_api_agents:
+    env_loop_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: webshop_env
+      # Structural requirement of the base agent config; unused whenever the
+      # /run body carries policy_base_url (the Miles training path).
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      # Episode turn budget = MODEL CALLS; matches the env's max_episode_steps
+      # (one action attempt per model call under strict Gymnasium endings).
+      max_turns: 15
+      datasets:
+        - name: example
+          type: example
+          jsonl_fpath: resources_servers/webshop_env/data/example.jsonl
+          # synthetic fixture rows authored in this repository; the WebShop catalog and goals are the authors' (docs/data.md)
+          license: Apache 2.0

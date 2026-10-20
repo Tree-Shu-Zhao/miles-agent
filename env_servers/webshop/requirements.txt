@@ -1,0 +1,32 @@
+# WebShop engine-server runtime (python 3.10; see setup.sh). Pins are the
+# vendored fork's requirements (webshop/requirements.txt) minus what the text
+# env never uses (gradio, peft) and its stray/dev pins (env, train, pytest,
+# requests_mock); gym stays because WebAgentTextEnv subclasses gym.Env,
+# selenium stays because web_agent_site.envs.__init__ imports the (unused)
+# browser env unconditionally. These pins are load-bearing for reward/search
+# PARITY — do not bump without re-validating scores.
+beautifulsoup4==4.11.1
+cleantext==1.1.4
+Flask==2.1.2
+Werkzeug==2.1.0
+gdown
+gym==0.24.0
+numpy==1.26.4
+pandas==2.2.3
+pydantic==2.10.6
+pyserini==0.17.0
+PyYAML==6.0.2
+rank_bm25==0.2.2
+requests==2.27.1
+rich==12.4.4
+scikit_learn
+selenium==4.2.0
+spacy==3.7.2
+thefuzz==0.19.0
+torch==2.6.0
+tqdm==4.64.0
+transformers==4.51.1
+
+# session-server layer (env_servers/webshop/session_server.py)
+fastapi
+uvicorn

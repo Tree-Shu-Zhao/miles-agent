@@ -1,0 +1,14 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "extraPaths": [
+    "3rdparty/Gym",
+    "recipes/search_r1"
+  ],
+  "exclude": [
+    "3rdparty",
+    ".venv",
+    "**/__pycache__"
+  ],
+  "typeCheckingMode": "basic"
+}

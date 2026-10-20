@@ -1,0 +1,31 @@
+# The vendored WebShop fork CODE (webshop/) IS committed so miles-agent is
+# self-contained (no dependency on any other repo). setup.sh never writes into
+# this tree: it rsyncs the code to a writable copy under $WEBSHOP_HOME/webshop
+# and downloads the catalog + builds the Lucene index THERE (the only symlink,
+# search_engine/indexes -> indexes_<mode>, lives inside that copy). The
+# patterns below keep the same heavy/generated artifacts out of git as a
+# safety net: an upstream checkout that still carries them, or a setup.sh run
+# pointed at this tree via WEBSHOP_VENDOR.
+#
+# NOTE: gitignore has no inline comments; every pattern is on its own line.
+
+# downloaded catalog (items_*.json)
+webshop/data
+# Lucene index symlink -> indexes_<mode>
+webshop/search_engine/indexes
+# index build staging (documents.jsonl) + built Lucene indexes
+webshop/search_engine/resources_*/
+webshop/search_engine/indexes_*/
+# 16 MB Selenium binary, unused by the text env
+webshop/web_agent_site/envs/chromedriver
+# RL baselines, never imported
+webshop/baseline_models/
+# runtime session dumps
+webshop/user_session_logs/
+
+# caches / local build detritus
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+uv.lock

@@ -1,0 +1,28 @@
+[project]
+name = "miles-harbor"
+version = "0.0.1"
+# Gym's floor; Harbor itself needs >= 3.12.
+requires-python = ">= 3.13.14"
+dependencies = [
+    # Harbor runs the trials unmodified (agent, verifier, timeouts); this package adds the trial server and the
+    # harnesses; the trial's environment is Harbor's docker environment or the backend HARBOR_ENVIRONMENT_IMPORT_PATH
+    # names. Pinned: that backend implements this release's BaseEnvironment contract.
+    "harbor==0.24.0",
+    "nemo-gym[sandbox]",
+]
+
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools >= 61", "setuptools-scm"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["miles_harbor"]
+
+# 2 levels up = repo root; Gym is the pinned submodule there.
+[tool.uv.sources]
+nemo-gym = { path = "../../3rdparty/Gym", editable = true }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,1013 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shu Zhao <shuzhao.cs@gmail.com>
+Date: Mon, 12 Oct 2026 14:44:12 -0700
+Subject: [PATCH] feat: --preempt-sentinel saves and stops before a kill
+
+Slurm preempts with a grace period (a preemptable QOS, say: a
+signal, then the kill after the grace period) and warns before the time limit
+with --signal. A job script turns either signal into the sentinel file;
+the drivers poll it and stop at the earliest safe point:
+
+- an in-flight rollout or eval is abandoned and never trained on. The
+  executor cancels the train rollout coroutine, so it stops drawing
+  prompts and the data source holds still while it is saved, and calls
+  the agent abort hook. The inference controller pauses every engine in
+  abort mode: running requests are aborted and new ones held, so agent
+  episodes that outlive the rollout cannot reach an engine whose memory
+  is being released (SGLang asserts the engine is idle there).
+- the latest trained step is saved unless it is already on disk. Right
+  after a train step the actor is resident; otherwise (colocated) the
+  engines hand the GPUs back and an offloaded actor wakes, and
+  save_model first restores the trained weights from the host backup,
+  since a woken actor holds fresh pages under --offload-train.
+- <sentinel>.done records the rollout id the run is durable up to; the
+  job script then requeues or exits, and the resumed run loads it.
+
+The aborted rollout's prompts are skipped on resume (their draws are in
+the saved data-source state), as with train_async's prefetched rollout.
+PPO critics are saved only inside their train step, so a preempt stop
+there warns and reports the last periodic save instead.
+---
+ miles/backends/megatron_utils/actor.py    |  11 ++
+ miles/ray/rollout/inference_controller.py |  11 ++
+ miles/ray/rollout/rollout_executor.py     |  40 ++++++-
+ miles/ray/rollout/rollout_server.py       |  11 ++
+ miles/ray/rollout/server_cell.py          |   4 +
+ miles/utils/arguments.py                  |  15 +++
+ miles/utils/preempt.py                    |  79 ++++++++++++++
+ tests/fast/fixtures/driver_fakes.py       |  24 +++++
+ tests/fast/test_train.py                  | 126 ++++++++++++++++++++++
+ tests/fast/test_train_async.py            |  47 ++++++++
+ tests/fast/utils/test_preempt.py          |  72 +++++++++++++
+ train.py                                  |  98 +++++++++++++----
+ train_async.py                            |  67 ++++++++++--
+ 13 files changed, 576 insertions(+), 29 deletions(-)
+ create mode 100644 miles/utils/preempt.py
+ create mode 100644 tests/fast/utils/test_preempt.py
+
+diff --git a/miles/backends/megatron_utils/actor.py b/miles/backends/megatron_utils/actor.py
+index 344133858..3444b5237 100644
+--- a/miles/backends/megatron_utils/actor.py
++++ b/miles/backends/megatron_utils/actor.py
+@@ -218,6 +218,8 @@ class MegatronTrainRayActor(TrainRayActor):
+ 
+         self._asleep = False
+         self._grad_buffer_paused = False
++        # True between a wake_up and the next host-backup restore (see save_model)
++        self._resident_weights_stale = False
+ 
+         if role == "critic":
+             load_output = self._load_state_core(
+@@ -506,6 +508,9 @@ class MegatronTrainRayActor(TrainRayActor):
+         clear_memory()
+         reload_process_groups()
+         self._asleep = False
++        # without a param-buffer CPU backup the params came back as fresh pages; the trained
++        # weights are in the host backup until a _switch_model restores them
++        self._resident_weights_stale = self.role != "critic" and self._enable_weight_backup
+         print_memory("after wake_up model")
+ 
+     @property
+@@ -540,6 +545,7 @@ class MegatronTrainRayActor(TrainRayActor):
+             raise ValueError(f"Cannot switch to unknown model tag: {target_tag}")
+         self.weights_backuper.restore(target_tag)
+         self._active_model_tag = target_tag
++        self._resident_weights_stale = False
+ 
+     def _set_replay_stage(self, stage: str) -> None:
+         for m in all_replay_managers:
+@@ -816,6 +822,11 @@ class MegatronTrainRayActor(TrainRayActor):
+         if self.args.debug_rollout_only:
+             return
+ 
++        if self._resident_weights_stale:
++            # Saved after a wake_up with no train step since (the --preempt-sentinel exit save):
++            # the resident params are fresh pages, so restore the trained weights first.
++            self._switch_model("actor")
++
+         self._finalize_pending_async_save()
+ 
+         save(
+diff --git a/miles/ray/rollout/inference_controller.py b/miles/ray/rollout/inference_controller.py
+index 97b8a2c44..bd9b17629 100644
+--- a/miles/ray/rollout/inference_controller.py
++++ b/miles/ray/rollout/inference_controller.py
+@@ -123,6 +123,17 @@ class InferenceController:
+     async def abort_all(self) -> None:
+         await async_utils.gather_and_raise_first([srv.abort_all() for srv in self.servers.values()])
+ 
++    @with_lock
++    async def halt_generation(self) -> None:
++        """Abort every request and hold new ones for good (--preempt-sentinel: the run saves and exits).
++
++        Agent episodes outlive a cancelled rollout and keep calling the engines; held, their
++        requests leave the engines idle, so releasing engine memory cannot hit a running one.
++        No continue follows: these engines never serve again.
++        """
++        await self._health_monitoring_pause(None)
++        await async_utils.gather_and_raise_first([srv.halt_generation() for srv in self.servers.values()])
++
+     # -------------------------- registration -----------------------------
+ 
+     @lock_exempt
+diff --git a/miles/ray/rollout/rollout_executor.py b/miles/ray/rollout/rollout_executor.py
+index b6ca46f29..84ab69f30 100644
+--- a/miles/ray/rollout/rollout_executor.py
++++ b/miles/ray/rollout/rollout_executor.py
+@@ -1,4 +1,5 @@
+ import asyncio
++import inspect
+ import logging
+ import time
+ from collections import defaultdict
+@@ -25,7 +26,7 @@ from miles.rollout.base_types import (
+ from miles.rollout.checkpoint_eval import CheckpointEvalFn, EvalSkip
+ from miles.rollout.inference_rollout.compatibility import call_rollout_function, load_rollout_function
+ from miles.utils import object_store
+-from miles.utils.async_utils import maybe_await
++from miles.utils.async_utils import maybe_await, submit
+ from miles.utils.audit_utils.event_analyzer import analyzer as event_analyzer
+ from miles.utils.audit_utils.event_logger import checkpoint as event_logger_checkpoint
+ from miles.utils.audit_utils.event_logger.logger import event_logger_context
+@@ -38,6 +39,7 @@ from miles.utils.http_utils import init_http_client
+ from miles.utils.init_once import InitOnce, init_once
+ from miles.utils.logging_utils import configure_logger
+ from miles.utils.metric_checker import MetricChecker
++from miles.utils.misc import call_agent_abort_hook
+ from miles.utils.timer import timer
+ from miles.utils.tracking_utils.tracking import init_tracking
+ from miles.utils.weight_version import assert_samples_weight_version_sane, assert_weight_version_is_published
+@@ -118,6 +120,8 @@ class RolloutExecutor:
+             logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
+ 
+         self.rollout_id = -1
++        self._train_rollout_future = None
++        self._train_rollout_aborted = False
+         self._eval_lock = asyncio.Lock()
+         self._eval_fleet: RolloutExecutorEvalFleet | None = None
+ 
+@@ -260,14 +264,12 @@ class RolloutExecutor:
+             metrics = None
+         else:
+             if not self.use_legacy_rollout_v1:
+-                data = await asyncio.to_thread(
+-                    call_rollout_function,
+-                    self.generate_rollout,
++                data = await self._call_train_rollout(
+                     RolloutFnTrainInput(
+                         rollout_id=rollout_id,
+                         weight_version=self._weight_versions_of_model_id.get(trainer_model_id),
+                         trainer_model_id=trainer_model_id,
+-                    ),
++                    )
+                 )
+             else:
+                 data = await asyncio.to_thread(
+@@ -289,6 +291,34 @@ class RolloutExecutor:
+ 
+         return data, metadata, metrics
+ 
++    async def _call_train_rollout(self, input: RolloutFnTrainInput):
++        """call_rollout_function off this loop as before, but a coroutine rollout fn runs as a
++        future that abort_rollout() can cancel."""
++        output = await asyncio.to_thread(self.generate_rollout, input)
++        if not inspect.iscoroutine(output):
++            return output
++        if self._train_rollout_aborted:
++            output.close()
++            raise asyncio.CancelledError("the train rollout was aborted before it started")
++        self._train_rollout_future = submit(output)
++        try:
++            return await asyncio.wrap_future(self._train_rollout_future)
++        finally:
++            self._train_rollout_future = None
++
++    async def abort_rollout(self) -> None:
++        """Stop the in-flight train rollout for good (--preempt-sentinel: the driver is leaving).
++
++        Cancelling its coroutine stops it drawing prompts and submitting groups, so the data
++        source holds still while it is saved; the agent integration's abort hook stops the
++        episodes it can. Groups already submitted are left behind: the driver halts the engines
++        under them (InferenceController.halt_generation).
++        """
++        self._train_rollout_aborted = True
++        if (future := self._train_rollout_future) is not None:
++            future.cancel()
++        await call_agent_abort_hook(self.args)
++
+     # -------------------------- checkpointing -----------------------------
+ 
+     # TODO the train and eval rollout functions will become one object, so one save/load is enough here
+diff --git a/miles/ray/rollout/rollout_server.py b/miles/ray/rollout/rollout_server.py
+index 98fc54ec2..ad2d9f226 100644
+--- a/miles/ray/rollout/rollout_server.py
++++ b/miles/ray/rollout/rollout_server.py
+@@ -161,6 +161,17 @@ class RolloutServer:
+             ),
+         )
+ 
++    @requires_lock
++    async def halt_generation(self) -> None:
++        cells = self._addressable_cells()
++        await async_utils.gather_and_raise_first(
++            [asyncio.wait_for(cell.halt_generation(), timeout=ABORT_ALL_TIMEOUT_SECONDS) for cell in cells],
++            describe_failure=lambda index: (
++                f"Halting the generations of cell {cells[index].meta.cell_id} of {self.model_name} failed, so a "
++                f"request may still be running on it"
++            ),
++        )
++
+     @requires_lock
+     async def check_weights(
+         self, action: str, allow_quant_error: bool = False, selector: str = "all", skip_list: list[str] | None = None
+diff --git a/miles/ray/rollout/server_cell.py b/miles/ray/rollout/server_cell.py
+index c8df0f0ac..2be284340 100644
+--- a/miles/ray/rollout/server_cell.py
++++ b/miles/ray/rollout/server_cell.py
+@@ -279,6 +279,10 @@ class ServerCell:
+     async def abort_all(self):
+         return await self.api_client.abort_all_requests(timeout=ABORT_REQUEST_TIMEOUT_SECONDS)
+ 
++    async def halt_generation(self):
++        # abort-mode pause: SGLang aborts until nothing runs, then holds every new request
++        return await self.api_client.pause_generation(mode="abort")
++
+     async def check_weights(self, action: str, allow_quant_error: bool, selector: str, skip_list: list[str] | None):
+         return await self.api_client.check_weights(
+             action=action, allow_quant_error=allow_quant_error, selector=selector, skip_list=skip_list
+diff --git a/miles/utils/arguments.py b/miles/utils/arguments.py
+index b3dfd8c04..4b2430957 100644
+--- a/miles/utils/arguments.py
++++ b/miles/utils/arguments.py
+@@ -1553,6 +1553,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+                     "exists at an iteration's save point, a checkpoint is saved and the file is removed."
+                 ),
+             )
++            parser.add_argument(
++                "--preempt-sentinel",
++                type=str,
++                default=None,
++                help=(
++                    "Path to a file whose appearance means the job is about to be killed (a job script "
++                    "turns the scheduler's preemption or time-limit signal into it). The driver then stops "
++                    "at the earliest safe point: an in-flight rollout or eval is abandoned and never "
++                    "trained on, the latest trained state is saved unless it is already on disk, and "
++                    "'<path>.done' records the rollout id a resumed run continues after."
++                ),
++            )
+             parser.add_argument(
+                 "--custom-megatron-post-save-hook-path",
+                 type=str,
+@@ -3464,6 +3476,9 @@ def miles_validate_args(args):
+     if args.save_trigger_sentinel is not None:
+         assert args.save is not None, "'--save' is required when save_trigger_sentinel is set."
+ 
++    if args.preempt_sentinel is not None:
++        assert args.save is not None, "'--save' is required when preempt_sentinel is set."
++
+     if args.custom_megatron_post_save_hook_path is not None:
+         assert args.save is not None, "'--save' is required when custom_megatron_post_save_hook_path is set."
+ 
+diff --git a/miles/utils/preempt.py b/miles/utils/preempt.py
+new file mode 100644
+index 000000000..c29c25524
+--- /dev/null
++++ b/miles/utils/preempt.py
+@@ -0,0 +1,79 @@
++"""--preempt-sentinel: leave a run resumable when its job is about to be killed.
++
++A job script turns the scheduler's warning (Slurm signals it at preemption, and
++``--signal``'s lead before the time limit) into the sentinel file. The drivers
++then stop at the earliest safe point: an in-flight rollout or eval is abandoned
++and never trained on, the latest trained state is saved unless it is already on
++disk, and ``<sentinel>.done`` records the rollout id the run is durable up to,
++which tells the job script it may requeue or exit.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++import os
++from collections.abc import Awaitable
++from typing import TypeVar
++
++logger = logging.getLogger(__name__)
++
++_T = TypeVar("_T")
++
++POLL_SECONDS = 2.0
++
++
++class PreemptWatch:
++    def __init__(self, sentinel: str | None) -> None:
++        self.sentinel = sentinel
++        self._fired = asyncio.Event()
++        self._poller = asyncio.create_task(self._poll()) if sentinel is not None else None
++
++    async def _poll(self) -> None:
++        while not os.path.exists(self.sentinel):
++            await asyncio.sleep(POLL_SECONDS)
++        logger.warning(f"Preempt sentinel {self.sentinel} appeared: saving the latest trained state and stopping")
++        self._fired.set()
++
++    @property
++    def fired(self) -> bool:
++        return self._fired.is_set()
++
++    async def race(self, awaitable: Awaitable[_T]) -> tuple[bool, _T | None]:
++        """Await ``awaitable`` unless the sentinel appears first.
++
++        Returns ``(True, result)``, or ``(False, None)`` with the awaitable cancelled; the
++        caller then stops whatever it had started remotely.
++        """
++        if self._poller is None:
++            return True, await awaitable
++        task = asyncio.ensure_future(awaitable)
++        fired = asyncio.ensure_future(self._fired.wait())
++        try:
++            await asyncio.wait({task, fired}, return_when=asyncio.FIRST_COMPLETED)
++        finally:
++            fired.cancel()
++        if task.done():
++            return True, task.result()
++        task.cancel()
++        task.add_done_callback(_retrieve)
++        return False, None
++
++    def mark_done(self, rollout_id: int) -> None:
++        """Record that the run is durable up to ``rollout_id`` (-1: nothing trained yet)."""
++        path = f"{self.sentinel}.done"
++        with open(f"{path}.tmp", "w") as f:
++            json.dump({"rollout_id": rollout_id}, f)
++        os.replace(f"{path}.tmp", path)
++        logger.warning(f"Preempt: the run is durable up to rollout {rollout_id}, stopping")
++
++    def dispose(self) -> None:
++        if self._poller is not None:
++            self._poller.cancel()
++
++
++def _retrieve(task: asyncio.Future) -> None:
++    # an abandoned call may still fail; its error is expected and must not be logged as unretrieved
++    if not task.cancelled():
++        task.exception()
+diff --git a/tests/fast/fixtures/driver_fakes.py b/tests/fast/fixtures/driver_fakes.py
+index 9e19f2062..b2e836d48 100644
+--- a/tests/fast/fixtures/driver_fakes.py
++++ b/tests/fast/fixtures/driver_fakes.py
+@@ -1,6 +1,8 @@
+ import asyncio
++import json
+ from collections import defaultdict
+ from collections.abc import Callable
++from pathlib import Path
+ from types import SimpleNamespace
+ from typing import Any
+ 
+@@ -24,6 +26,21 @@ class FakeRemoteMethod:
+         return self._fn(*args, **kwargs)
+ 
+ 
++class PreemptOnArrival:
++    """A generation or eval gate that raises the preempt sentinel and then never opens."""
++
++    def __init__(self, sentinel: Path) -> None:
++        self.sentinel = sentinel
++
++    async def wait(self) -> None:
++        self.sentinel.touch()
++        await asyncio.Event().wait()
++
++
++def read_preempt_done(sentinel: Path) -> int:
++    return json.loads(Path(f"{sentinel}.done").read_text())["rollout_id"]
++
++
+ class FakeWorkerManager:
+     def __init__(self, events: list[str]) -> None:
+         self.events = events
+@@ -48,6 +65,7 @@ class FakeRolloutExecutor:
+         self.eval = FakeRemoteMethod(self._eval)
+         self.save = FakeRemoteMethod(self._save)
+         self.report_eval_skip = FakeRemoteMethod(self._report_eval_skip)
++        self.abort_rollout = FakeRemoteMethod(self._abort_rollout)
+ 
+     async def _get(self, rollout_id: int) -> RolloutDataPack:
+         self.events.append(f"generate_start:{rollout_id}")
+@@ -72,6 +90,9 @@ class FakeRolloutExecutor:
+     async def _report_eval_skip(self, rollout_id: int, reason: str) -> None:
+         self.events.append(f"eval_skip:{rollout_id}:{reason}")
+ 
++    async def _abort_rollout(self) -> None:
++        self.events.append("abort_rollout")
++
+ 
+ class FakeInferenceController:
+     def __init__(self, events: list[str]) -> None:
+@@ -97,6 +118,9 @@ class FakeInferenceController:
+     async def offload(self, tags: list[str]) -> None:
+         self.events.append(f"offload:{','.join(tags)}")
+ 
++    async def halt_generation(self) -> None:
++        self.events.append("halt_generation")
++
+     async def dispose(self) -> None:
+         self.events.append("inference_dispose")
+ 
+diff --git a/tests/fast/test_train.py b/tests/fast/test_train.py
+index a6ae2e5e7..ac50c2014 100644
+--- a/tests/fast/test_train.py
++++ b/tests/fast/test_train.py
+@@ -1,3 +1,4 @@
++import asyncio
+ from functools import partial
+ from types import SimpleNamespace
+ from typing import Any
+@@ -7,14 +8,18 @@ import train as train_driver
+ from tests.fast.fixtures.driver_fakes import (
+     FakeInferenceController,
+     FakeObjectStore,
++    FakeRemoteMethod,
+     FakeRolloutExecutor,
+     FakeTrainingModel,
+     FakeWorkerManager,
++    PreemptOnArrival,
++    read_preempt_done,
+ )
+ 
+ from miles.backends.training_utils.types import TrainStepOutcome, TrainStepOutput
+ from miles.ray import placement_group, wiring
+ from miles.utils import object_store
++from miles.utils import preempt as preempt_utils
+ from miles.utils.async_utils import with_disposer
+ 
+ 
+@@ -38,6 +43,7 @@ def _make_args(**overrides: Any) -> SimpleNamespace:
+         offload_rollout=False,
+         offload_rollout_level="",
+         offload_train=False,
++        preempt_sentinel=None,
+         save_interval=None,
+         save_trigger_sentinel=None,
+         skip_eval_before_train=False,
+@@ -281,3 +287,123 @@ class TestTerminalLifecycle:
+             events.index(event) < events.index("manager_shutdown") for event in events if event.endswith("_dispose")
+         )
+         assert events.index("manager_shutdown") < events.index("manager_kill")
++
++
++class TestPreemptSentinel:
++    @pytest.fixture(autouse=True)
++    def _fast_poll(self, monkeypatch: pytest.MonkeyPatch) -> None:
++        monkeypatch.setattr(preempt_utils, "POLL_SECONDS", 0.01)
++
++    async def test_a_preempted_rollout_is_abandoned_and_the_last_trained_step_saved(
++        self, monkeypatch: pytest.MonkeyPatch, tmp_path
++    ) -> None:
++        """The rollout in flight is never trained on; the engines stop and give their memory
++        back before the offloaded actor wakes to save the step trained just before it."""
++        events: list[str] = []
++        sentinel = tmp_path / "preempt"
++        args = _make_args(
++            num_rollout=4,
++            offload_rollout=True,
++            offload_rollout_level="kv_cache,weight",
++            offload_train=True,
++            preempt_sentinel=str(sentinel),
++        )
++        components = _install_driver_fakes(monkeypatch, args, events)
++        components.rollout_executor.generation_gates[2] = PreemptOnArrival(sentinel)
++
++        await with_disposer(train_driver.train, args)
++
++        assert components.actor_model.trained == [0, 1]
++        assert components.actor_model.saved == [1]
++        stop = events[events.index("generate_start:2") :]
++        offload = next(event for event in stop if event.startswith("offload:"))
++        assert (
++            stop.index("abort_rollout")
++            < stop.index("halt_generation")
++            < stop.index(offload)
++            < stop.index("actor_onload")
++            < stop.index("actor_save:1")
++            < stop.index("executor_save:1")
++        )
++        assert "prepare_rollout:3" not in events
++        assert read_preempt_done(sentinel) == 1
++
++    async def test_a_sentinel_raised_during_training_saves_that_step_and_stops(
++        self, monkeypatch: pytest.MonkeyPatch, tmp_path
++    ) -> None:
++        """The step in flight completes and is saved while resident; no handoff, eval or rollout follows."""
++        events: list[str] = []
++        sentinel = tmp_path / "preempt"
++        args = _make_args(num_rollout=4, eval_interval=1, skip_eval_before_train=True, preempt_sentinel=str(sentinel))
++        components = _install_driver_fakes(monkeypatch, args, events)
++        train = components.actor_model.train
++
++        async def train_then_preempt(rollout_id: int, rollout_data: Any, external_data: Any = None) -> Any:
++            output = await train(rollout_id, rollout_data, external_data)
++            if rollout_id == 1:
++                sentinel.touch()
++                await asyncio.sleep(0.2)  # the watch sees it before the step returns
++            return output
++
++        components.actor_model.train = train_then_preempt
++
++        await with_disposer(train_driver.train, args)
++
++        assert components.actor_model.trained == [0, 1]
++        assert components.actor_model.saved == [1]
++        after = events[events.index("actor_train:1") :]
++        assert "abort_rollout" not in after
++        assert not [event for event in after if event.startswith(("update_weights", "eval:", "prepare_rollout"))]
++        assert read_preempt_done(sentinel) == 1
++
++    async def test_a_sentinel_up_before_the_save_decision_makes_that_save_the_last(
++        self, monkeypatch: pytest.MonkeyPatch, tmp_path
++    ) -> None:
++        """Raised while the engines hand over the GPUs, it turns the coming step's save on, and
++        the stop that follows finds that state already on disk."""
++        events: list[str] = []
++        sentinel = tmp_path / "preempt"
++        args = _make_args(
++            num_rollout=4, offload_rollout=True, offload_rollout_level="kv_cache", preempt_sentinel=str(sentinel)
++        )
++        components = _install_driver_fakes(monkeypatch, args, events)
++        offload = components.inference_controller.offload
++
++        async def offload_then_preempt(tags: list[str]) -> None:
++            await offload(tags)
++            if "generate_done:1" in events:
++                sentinel.touch()
++                await asyncio.sleep(0.2)
++
++        components.inference_controller.offload = offload_then_preempt
++
++        await with_disposer(train_driver.train, args)
++
++        assert components.actor_model.trained == [0, 1]
++        assert components.actor_model.saved == [1]
++        assert events.count("executor_save:1") == 1
++        assert read_preempt_done(sentinel) == 1
++
++    async def test_a_resumed_run_stopped_before_its_first_step_saves_nothing(
++        self, monkeypatch: pytest.MonkeyPatch, tmp_path
++    ) -> None:
++        """Stopped in the eval before training, it reports the loaded checkpoint as durable."""
++        events: list[str] = []
++        sentinel = tmp_path / "preempt"
++        args = _make_args(num_rollout=6, eval_interval=1, start_rollout_id=3, preempt_sentinel=str(sentinel))
++        components = _install_driver_fakes(monkeypatch, args, events)
++        gate = PreemptOnArrival(sentinel)
++
++        async def eval_until_preempted(rollout_id: int, **_kwargs: Any) -> None:
++            events.append(f"eval:{rollout_id}")
++            await gate.wait()
++
++        components.rollout_executor.eval = FakeRemoteMethod(eval_until_preempted)
++
++        await with_disposer(train_driver.train, args)
++
++        assert components.actor_model.trained == []
++        assert components.actor_model.saved == []
++        assert "halt_generation" in events
++        assert "prepare_rollout:3" not in events
++        assert read_preempt_done(sentinel) == 2
+diff --git a/tests/fast/test_train_async.py b/tests/fast/test_train_async.py
+index 6bbe52b31..3f0878560 100644
+--- a/tests/fast/test_train_async.py
++++ b/tests/fast/test_train_async.py
+@@ -11,12 +11,15 @@ from tests.fast.fixtures.driver_fakes import (
+     FakeRolloutExecutor,
+     FakeTrainingModel,
+     FakeWorkerManager,
++    PreemptOnArrival,
++    read_preempt_done,
+ )
+ 
+ from miles.backends.training_utils.types import TrainStepOutcome, TrainStepOutput
+ from miles.ray import placement_group as placement_group_mod
+ from miles.ray import wiring
+ from miles.utils import object_store
++from miles.utils import preempt as preempt_utils
+ from miles.utils.async_utils import with_disposer
+ 
+ 
+@@ -42,6 +45,7 @@ def _make_args(**overrides: Any) -> SimpleNamespace:
+         num_critic_only_steps=0,
+         num_rollout=0,
+         offload_train=False,
++        preempt_sentinel=None,
+         save_hf=None,
+         save_interval=None,
+         save_trigger_sentinel=None,
+@@ -268,3 +272,46 @@ class TestTerminalLifecycle:
+             events.index(event) < events.index("manager_shutdown") for event in events if event.endswith("_dispose")
+         )
+         assert events.index("manager_shutdown") < events.index("manager_kill")
++
++
++class TestPreemptSentinel:
++    @pytest.fixture(autouse=True)
++    def _fast_poll(self, monkeypatch: pytest.MonkeyPatch) -> None:
++        monkeypatch.setattr(preempt_utils, "POLL_SECONDS", 0.01)
++
++    async def test_a_preempted_prefetch_is_abandoned_and_the_resident_actor_saved(
++        self, monkeypatch: pytest.MonkeyPatch, tmp_path
++    ) -> None:
++        """The sentinel lands while the next rollout generates: whichever wait notices it, the
++        step trained last is saved exactly once and no weight update or later step follows."""
++        events: list[str] = []
++        sentinel = tmp_path / "preempt"
++        args = _make_args(num_rollout=4, preempt_sentinel=str(sentinel))
++        components = _install_driver_fakes(monkeypatch, args, events)
++        components.rollout_executor.generation_gates[2] = PreemptOnArrival(sentinel)
++
++        await with_disposer(train_async_driver.train, args)
++
++        assert components.actor_model.trained == [0, 1]
++        assert components.actor_model.saved == [1]
++        assert events.count("executor_save:1") == 1
++        assert {"abort_rollout", "halt_generation"} <= set(events)
++        assert "actor_onload" not in events
++        assert "update_weights:1" not in events
++        assert read_preempt_done(sentinel) == 1
++
++    async def test_a_run_stopped_before_its_first_step_saves_nothing(
++        self, monkeypatch: pytest.MonkeyPatch, tmp_path
++    ) -> None:
++        events: list[str] = []
++        sentinel = tmp_path / "preempt"
++        args = _make_args(num_rollout=4, preempt_sentinel=str(sentinel))
++        components = _install_driver_fakes(monkeypatch, args, events)
++        components.rollout_executor.generation_gates[0] = PreemptOnArrival(sentinel)
++
++        await with_disposer(train_async_driver.train, args)
++
++        assert components.actor_model.trained == []
++        assert components.actor_model.saved == []
++        assert "halt_generation" in events
++        assert read_preempt_done(sentinel) == -1
+diff --git a/tests/fast/utils/test_preempt.py b/tests/fast/utils/test_preempt.py
+new file mode 100644
+index 000000000..827792ce3
+--- /dev/null
++++ b/tests/fast/utils/test_preempt.py
+@@ -0,0 +1,72 @@
++import asyncio
++import json
++
++import pytest
++
++from miles.utils import preempt as preempt_utils
++from miles.utils.preempt import PreemptWatch
++
++
++@pytest.fixture(autouse=True)
++def _fast_poll(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(preempt_utils, "POLL_SECONDS", 0.01)
++
++
++class TestRace:
++    async def test_the_awaitable_wins_while_no_sentinel_appears(self, tmp_path) -> None:
++        watch = PreemptWatch(str(tmp_path / "preempt"))
++        try:
++            assert await watch.race(asyncio.sleep(0, result="data")) == (True, "data")
++            assert not watch.fired
++        finally:
++            watch.dispose()
++
++    async def test_a_sentinel_cancels_the_awaitable(self, tmp_path) -> None:
++        sentinel = tmp_path / "preempt"
++        watch = PreemptWatch(str(sentinel))
++        cancelled = asyncio.Event()
++
++        async def endless() -> None:
++            try:
++                await asyncio.Event().wait()
++            except asyncio.CancelledError:
++                cancelled.set()
++                raise
++
++        async def raise_sentinel() -> None:
++            await asyncio.sleep(0.05)
++            sentinel.touch()
++
++        raiser = asyncio.ensure_future(raise_sentinel())
++        try:
++            assert await watch.race(endless()) == (False, None)
++            await asyncio.wait_for(cancelled.wait(), timeout=1)
++            assert watch.fired
++        finally:
++            await raiser
++            watch.dispose()
++
++    async def test_a_sentinel_present_at_start_fires_at_once(self, tmp_path) -> None:
++        """A signal that arrives while the run still starts up stops it at its first wait."""
++        sentinel = tmp_path / "preempt"
++        sentinel.touch()
++        watch = PreemptWatch(str(sentinel))
++        try:
++            assert await watch.race(asyncio.Event().wait()) == (False, None)
++        finally:
++            watch.dispose()
++
++    async def test_without_a_sentinel_race_is_a_plain_await(self) -> None:
++        watch = PreemptWatch(None)
++        assert await watch.race(asyncio.sleep(0, result=7)) == (True, 7)
++        assert not watch.fired
++        watch.dispose()
++
++
++class TestMarkDone:
++    async def test_mark_done_records_the_durable_rollout(self, tmp_path) -> None:
++        watch = PreemptWatch(str(tmp_path / "preempt"))
++        watch.mark_done(5)
++        watch.dispose()
++        assert json.loads((tmp_path / "preempt.done").read_text()) == {"rollout_id": 5}
++        assert not (tmp_path / "preempt.done.tmp").exists()
+diff --git a/train.py b/train.py
+index 93b90984f..7ed5cc13c 100644
+--- a/train.py
++++ b/train.py
+@@ -18,6 +18,7 @@ from miles.utils.ft_utils.mini_ft_controller import maybe_start_mini_ft_controll
+ from miles.utils.lora.utils import lora_rollout_enabled
+ from miles.utils.misc import should_run_periodic_action
+ from miles.utils.orchestration_utils import init_orchestration_script
++from miles.utils.preempt import PreemptWatch
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -61,6 +62,55 @@ async def train(args, *, disposer: Disposer):
+     eval_dispatcher = EvalDispatcher(args, actor_model, rollout_executor)
+     disposer.add(eval_dispatcher.drain)
+ 
++    preempt = PreemptWatch(args.preempt_sentinel)
++    disposer.add(preempt)
++    # the latest trained rollout and the latest one on disk: the loaded checkpoint's, or -1
++    last_trained = last_saved = args.start_rollout_id - 1
++
++    async def hand_gpus_to_train():
++        if args.offload_rollout:
++            if args.colocate_memory_peak_device == "gpu":
++                await inference_controller.offload_kv()
++                await actor_model.onload()
++                await inference_controller.offload_weights()
++            else:
++                offload_tags = [GPU_MEMORY_TYPE_CUDA_GRAPH]
++                if "kv_cache" in args.offload_rollout_level:
++                    offload_tags.append(GPU_MEMORY_TYPE_KV_CACHE)
++                if "weight" in args.offload_rollout_level:
++                    offload_tags.append(GPU_MEMORY_TYPE_WEIGHTS)
++                await inference_controller.offload(tags=offload_tags)
++
++    async def stop_for_preempt(*, engines_hold_gpus: bool):
++        """Abandon generation, make the latest trained state durable and report it.
++
++        engines_hold_gpus: called from rollout / eval, where the engines hold the GPUs and an
++        offloaded actor sleeps, rather than right after a train step.
++        """
++        nonlocal last_saved
++        if engines_hold_gpus:
++            await rollout_executor.abort_rollout()
++            try:
++                await inference_controller.halt_generation()
++            except Exception:
++                # an engine still running a request may assert on the memory release below; save anyway
++                logger.exception("preempt: halting generation failed")
++        if last_trained > last_saved:
++            if args.use_critic:
++                logger.warning(
++                    "preempt: the critic is only saved inside its train step; the run resumes after %d",
++                    last_saved,
++                )
++            else:
++                if engines_hold_gpus:
++                    await hand_gpus_to_train()
++                    if args.offload_train:
++                        await actor_model.onload()
++                await actor_model.save_model(last_trained, force_sync=True)
++                await rollout_executor.save(last_trained)
++                last_saved = last_trained
++        preempt.mark_done(last_saved)
++
+     # special case for eval-only
+     if args.num_rollout == 0 and args.eval_interval is not None:
+         await inference_controller.prepare_eval()
+@@ -84,37 +134,37 @@ async def train(args, *, disposer: Disposer):
+     if args.num_rollout > args.start_rollout_id and args.eval_interval is not None and not args.skip_eval_before_train:
+         await inference_controller.prepare_eval()
+         if args.start_rollout_id == 0:
+-            await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint)
++            eval_done, _ = await preempt.race(eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint))
+         else:
+-            await eval_dispatcher.dispatch(args.start_rollout_id - 1)
++            eval_done, _ = await preempt.race(eval_dispatcher.dispatch(args.start_rollout_id - 1))
++        if not eval_done:
++            await stop_for_preempt(engines_hold_gpus=True)
++            return
+ 
+     # train loop.
+     # note that for async training, one can change the position of the sync operation(ray.get).
+     for rollout_id in range(args.start_rollout_id, args.num_rollout):
++        if preempt.fired:
++            await stop_for_preempt(engines_hold_gpus=True)
++            break
+         await inference_controller.prepare_rollout(rollout_id)
+-        rollout_data_pack = await rollout_executor.get(rollout_id)
++        rollout_done, rollout_data_pack = await preempt.race(rollout_executor.get(rollout_id))
++        if not rollout_done:
++            await stop_for_preempt(engines_hold_gpus=True)
++            break
+ 
+-        if args.offload_rollout:
+-            if args.colocate_memory_peak_device == "gpu":
+-                await inference_controller.offload_kv()
+-                await actor_model.onload()
+-                await inference_controller.offload_weights()
+-            else:
+-                offload_tags = [GPU_MEMORY_TYPE_CUDA_GRAPH]
+-                if "kv_cache" in args.offload_rollout_level:
+-                    offload_tags.append(GPU_MEMORY_TYPE_KV_CACHE)
+-                if "weight" in args.offload_rollout_level:
+-                    offload_tags.append(GPU_MEMORY_TYPE_WEIGHTS)
+-                await inference_controller.offload(tags=offload_tags)
++        await hand_gpus_to_train()
+ 
+         # Each model must be saved while its weights are still resident: with
+         # --offload-train the param-buffer CPU backup is disabled, so an
+         # offloaded model onloads to freshly-mapped (zero) pages and only the
+         # next train step's backup restore refills them. Saving after offload
+         # serializes zero bf16 weights (optimizer state, separately backed up,
+-        # stays real). Decide the save before training and save inline.
++        # stays real). Decide the save before training and save inline; a
++        # preempt sentinel that is already up makes this step's save the last.
+         external_save, do_save = save_due(rollout_id)
+-        force_sync = external_save or rollout_id == args.num_rollout - 1
++        do_save = do_save or preempt.fired
++        force_sync = external_save or preempt.fired or rollout_id == args.num_rollout - 1
+ 
+         if args.use_critic:
+             values = await critic_model.train(rollout_id, rollout_data_pack)
+@@ -134,12 +184,19 @@ async def train(args, *, disposer: Disposer):
+             if do_save:
+                 await actor_model.save_model(rollout_id, force_sync=force_sync)
+         remove_rollout_data_refs(args, rollout_data_pack)
++        last_trained = rollout_id
+ 
+         if do_save:
+             await rollout_executor.save(rollout_id)
++            last_saved = rollout_id
+             if external_save:
+                 os.remove(args.save_trigger_sentinel)
+ 
++        if preempt.fired:
++            # still resident unless the critic path offloaded the actor after its save
++            await stop_for_preempt(engines_hold_gpus=False)
++            break
++
+         # One predicate for both blocks: the handoff below exists to feed this eval on the last rollout.
+         eval_due = should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch, args.num_rollout)
+         if rollout_id + 1 < args.num_rollout or eval_due:
+@@ -159,7 +216,12 @@ async def train(args, *, disposer: Disposer):
+ 
+         if eval_due:
+             await inference_controller.prepare_eval()
+-            await eval_dispatcher.dispatch(rollout_id, force=rollout_id == args.num_rollout - 1)
++            eval_done, _ = await preempt.race(
++                eval_dispatcher.dispatch(rollout_id, force=rollout_id == args.num_rollout - 1)
++            )
++            if not eval_done:
++                await stop_for_preempt(engines_hold_gpus=True)
++                break
+ 
+         if (
+             args.debug_exit_after_rollout is not None
+diff --git a/train_async.py b/train_async.py
+index 0475a64b5..1c9b09e36 100644
+--- a/train_async.py
++++ b/train_async.py
+@@ -15,6 +15,7 @@ from miles.utils.data import remove_rollout_data_refs, remove_train_output_refs
+ from miles.utils.ft_utils.mini_ft_controller import maybe_start_mini_ft_controller
+ from miles.utils.misc import should_run_periodic_action
+ from miles.utils.orchestration_utils import init_orchestration_script
++from miles.utils.preempt import PreemptWatch
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -51,9 +52,42 @@ async def train(args, *, disposer: Disposer):
+     eval_dispatcher = EvalDispatcher(args, actor_model, rollout_executor)
+     disposer.add(eval_dispatcher.drain)
+ 
++    preempt = PreemptWatch(args.preempt_sentinel)
++    disposer.add(preempt)
++    # the latest trained rollout and the latest one on disk: the loaded checkpoint's, or -1
++    last_trained = last_saved = args.start_rollout_id - 1
++
++    async def stop_for_preempt(prefetch: asyncio.Task | None):
++        """Abandon generation, make the latest trained state durable and report it."""
++        nonlocal last_saved
++        if prefetch is not None:
++            prefetch.cancel()
++        await rollout_executor.abort_rollout()
++        try:
++            await inference_controller.halt_generation()
++        except Exception:
++            # the engines live on their own GPUs here; a stuck one does not block the save
++            logger.exception("preempt: halting generation failed")
++        if last_trained > last_saved:
++            if args.use_critic:
++                logger.warning(
++                    "preempt: the critic is only saved inside its train step; the run resumes after %d",
++                    last_saved,
++                )
++            else:
++                if args.offload_train:
++                    await actor_model.onload()
++                await actor_model.save_model(last_trained, force_sync=True)
++                await rollout_executor.save(last_trained)
++                last_saved = last_trained
++        preempt.mark_done(last_saved)
++
+     if args.eval_interval is not None and args.start_rollout_id == 0 and not args.skip_eval_before_train:
+         await inference_controller.prepare_eval()
+-        await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint)
++        eval_done, _ = await preempt.race(eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint))
++        if not eval_done:
++            await stop_for_preempt(None)
++            return
+ 
+     def save_due(rollout_id):
+         external = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
+@@ -71,7 +105,10 @@ async def train(args, *, disposer: Disposer):
+     for rollout_id in range(args.start_rollout_id, args.num_rollout):
+         # Sync the last generation
+         if rollout_data_next_future is not None:
+-            rollout_data_curr_ref = await rollout_data_next_future
++            rollout_done, rollout_data_curr_ref = await preempt.race(rollout_data_next_future)
++            if not rollout_done:
++                await stop_for_preempt(None)
++                break
+ 
+         has_next_rollout = rollout_id + 1 < args.num_rollout
+         weight_update_due = (rollout_id + 1) % args.update_weights_interval == 0
+@@ -87,9 +124,11 @@ async def train(args, *, disposer: Disposer):
+         # offloaded model onloads to freshly-mapped (zero) pages and only the
+         # next train step's backup restore refills them. Saving after offload
+         # serializes zero bf16 weights (optimizer state, separately backed up,
+-        # stays real). Decide the save before training and save inline.
++        # stays real). Decide the save before training and save inline; a
++        # preempt sentinel that is already up makes this step's save the last.
+         external_save, do_save = save_due(rollout_id)
+-        force_sync = external_save or rollout_id == args.num_rollout - 1
++        do_save = do_save or preempt.fired
++        force_sync = external_save or preempt.fired or rollout_id == args.num_rollout - 1
+ 
+         if args.use_critic:
+             values = await critic_model.train(rollout_id, rollout_data_curr_ref)
+@@ -109,16 +148,27 @@ async def train(args, *, disposer: Disposer):
+             if do_save:
+                 await actor_model.save_model(rollout_id, force_sync=force_sync)
+         remove_rollout_data_refs(args, rollout_data_curr_ref)
++        last_trained = rollout_id
+ 
+         if do_save:
+             await rollout_executor.save(rollout_id)
++            last_saved = rollout_id
+             if external_save:
+                 os.remove(args.save_trigger_sentinel)
+ 
++        if preempt.fired:
++            await stop_for_preempt(rollout_data_next_future)
++            break
++
+         if weight_update_due:
+             if not args.fully_async:
+                 # sync generate before update weights to prevent update weight in the middle of generation
+-                rollout_data_curr_ref = (await x) if (x := rollout_data_next_future) is not None else None
++                rollout_data_curr_ref = None
++                if (x := rollout_data_next_future) is not None:
++                    rollout_done, rollout_data_curr_ref = await preempt.race(x)
++                    if not rollout_done:
++                        await stop_for_preempt(None)
++                        break
+                 rollout_data_next_future = None
+             await update_weights(args, actor_model, rollout_executor, inference_controller, rollout_id=rollout_id)
+             if defer_next_drain:
+@@ -126,7 +176,12 @@ async def train(args, *, disposer: Disposer):
+ 
+         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch, args.num_rollout):
+             await inference_controller.prepare_eval()
+-            await eval_dispatcher.dispatch(rollout_id, force=rollout_id == args.num_rollout - 1)
++            eval_done, _ = await preempt.race(
++                eval_dispatcher.dispatch(rollout_id, force=rollout_id == args.num_rollout - 1)
++            )
++            if not eval_done:
++                await stop_for_preempt(rollout_data_next_future)
++                break
+ 
+         if (
+             args.debug_exit_after_rollout is not None

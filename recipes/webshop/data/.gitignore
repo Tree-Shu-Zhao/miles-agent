@@ -1,0 +1,5 @@
+# scripts/fetch_data.sh webshop --regenerate-goals writes the goal export here (its default
+# WEBSHOP_GOALS_FILE); the files are never committed (docs/data.md): exporter + digest only.
+webshop_goals.jsonl
+webshop_goals.jsonl.meta.json
+webshop_goals.meta.json

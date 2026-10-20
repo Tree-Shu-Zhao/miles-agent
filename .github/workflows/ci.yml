@@ -1,0 +1,101 @@
+name: ci
+on:
+  push:
+    branches: [main]
+    tags: ["*"]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      # tests/conftest.py renders miles' fixed chat templates (upstream files, present at the pin) and the setup.sh
+      # test wants both submodule checkouts in place: shallow, pin-only fetches, then the patch series on the miles
+      # pin — once 3rdparty/miles/.git exists, tests/test_miles_patches_applied.py runs and asserts every patch is
+      # applied (the sequence scripts/setup.sh runs: submodule update, then check_patches.sh --apply)
+      - run: git submodule update --init --depth 1 3rdparty/miles 3rdparty/Gym
+      - name: apply the patch series on the miles pin
+        env:
+          # `git am` inside scripts/check_patches.sh needs a committer identity; the authors come from the patches
+          GIT_COMMITTER_NAME: ci
+          GIT_COMMITTER_EMAIL: ci@example.invalid
+        run: bash scripts/check_patches.sh --apply
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: install the test group (pyproject [dependency-groups].test) and pyyaml (the scripts tests read yaml)
+        run: python -m pip install "pytest>=8" "pytest-asyncio>=0.24" "httpx>=0.27" "aiohttp>=3.10" "jinja2>=3.1" "pyyaml>=6"
+      - name: unit tests (no GPU, no network, no cluster)
+        run: python -m pytest -q -p no:cacheprovider -rs tests
+  identity-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install "pytest>=8"
+      - name: public-tree gate (identity, vendor, scheduler, hardware words; LICENSE, CITATION, README, export attributes)
+        run: python -m pytest -q -p no:cacheprovider tests/test_no_site_literals.py tests/test_repo_meta.py
+  shell:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: bash -n over every public script
+        run: |
+          set -e
+          find scripts examples -type f \( -name '*.sh' -o -name '*.sbatch' \) -print0 | xargs -0 -n1 bash -n
+      - name: shellcheck (warning level; sourced libs resolved from scripts/lib)
+        # advisory until its verdict on these scripts is known (never run on them yet); the bash -n step above is the required check
+        continue-on-error: true
+        run: |
+          find scripts examples -type f \( -name '*.sh' -o -name '*.sbatch' \) -print0 \
+            | xargs -0 shellcheck -S warning -x -P scripts/lib -e SC1090,SC1091
+  unit-gym:
+    # the schema/contract tests that need nemo-gym (they importorskip without it); both submodules shallow at their pins,
+    # then the patch series on the miles pin (as in `unit`: this job runs the whole tests/ too)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: git submodule update --init --depth 1 3rdparty/miles 3rdparty/Gym
+      - name: apply the patch series on the miles pin
+        env:
+          GIT_COMMITTER_NAME: ci
+          GIT_COMMITTER_EMAIL: ci@example.invalid
+        run: bash scripts/check_patches.sh --apply
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install 3.13
+      - run: uv sync --locked --group test --group gym
+      - run: uv run python -m pytest -q -p no:cacheprovider -rs tests
+  patches-apply:
+    # the nine patches apply on the pinned miles commit (S6/R21); shallow fetch of the pin only
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: git submodule update --init --depth 1 3rdparty/miles
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install "pytest>=8"
+      - name: apply the series on the pin and run the pin test
+        env:
+          # `git am` inside scripts/check_patches.sh needs a committer identity; the authors come from the patches
+          GIT_COMMITTER_NAME: ci
+          GIT_COMMITTER_EMAIL: ci@example.invalid
+        run: |
+          set -e
+          bash scripts/check_patches.sh --apply
+          python -m pytest -q -p no:cacheprovider tests/test_miles_patches_applied.py

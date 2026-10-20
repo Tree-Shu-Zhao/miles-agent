@@ -1,0 +1,63 @@
+# Top-level keys are INSTANCE names (what ServerRefs and CLI overrides
+# address); the nested key under the server-type section selects the
+# implementation directory. Kept identical (alfworld_env) like wiki_search.
+alfworld_env:
+  resources_servers:
+    alfworld_env:
+      entrypoint: app.py
+      domain: games
+      verified: false
+      description: ALFWorld TextWorld household tasks - Gymnasium protocol; /reset loads a game
+        by run-body game_file under $ALFWORLD_DATA (cookie-keyed session), /step plays the first
+        act tool call in the model turn (structured command argument, no text parsing); binary
+        success reward from info["won"] at the terminal step; TTL sweeper evicts sessions
+        abandoned by aborted episodes.
+      # DO NOT set num_workers here: per-session env state lives in this
+      # process (the server asserts num_workers in (None, 1) at startup).
+      max_episode_steps: 30
+      expose_admissible_commands: true
+      max_admissible_commands: 60
+      max_obs_chars: 2048
+      max_concurrency: 32
+      # Env-hosting worker processes (_worker.py): game loads parallelize
+      # env_workers-ways instead of serializing in-process, so a full
+      # 512-session reset wave drains in tens of seconds (the serial path
+      # livelocked the trainer, 2026-08-31). 0 = legacy in-process envs.
+      # Keep max_concurrency above this so waves saturate the workers.
+      # 128 keeps queue depth at 4 for a 512-session wave: at 16 the depth-32
+      # queue put 2-5 s on every /step (alftrain1 steps 0-42, and it dominated
+      # rollout wall: corr 0.79 vs 0.18 for response length). ~100 MB/worker,
+      # ~10 cores of aggregate env compute on a many-core node.
+      env_workers: 128
+      # Per env IPC op; on breach the worker is killed+respawned and the
+      # affected episodes are dropped. Loads are ~seconds; fires on wedges.
+      env_call_timeout_s: 300.0
+      # Idle-env reuse pool keyed by game_file (~5 MB per parked env); a
+      # pooled re-reset is ~5x cheaper than a fresh load. 0 disables pooling.
+      # 256 lets a full wave's 8-samples-per-game reuse survive eviction
+      # churn (64 unique games x 8 samples per 512-session wave).
+      env_pool_size: 256
+      # Must exceed NEMO_GYM_RUN_TIMEOUT (1200 s in recipes/alfworld/run.py).
+      session_ttl_s: 1800.0
+      sweep_interval_s: 60.0
+
+alfworld_agent:
+  responses_api_agents:
+    env_loop_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: alfworld_env
+      # Structural requirement of the base agent config; unused whenever the
+      # /run body carries policy_base_url (the Miles training path).
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      # Episode turn budget = MODEL CALLS; matches the env's max_episode_steps
+      # (one action attempt per model call under strict Gymnasium endings).
+      max_turns: 30
+      datasets:
+        - name: example
+          type: example
+          jsonl_fpath: resources_servers/alfworld_env/data/example.jsonl
+          license: MIT

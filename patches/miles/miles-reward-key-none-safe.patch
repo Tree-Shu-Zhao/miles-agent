@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shu Zhao <shuzhao.cs@gmail.com>
+Date: Sat, 29 Aug 2026 19:32:06 -0700
+Subject: [PATCH] fix: None-safe reward handling under reward_key and
+ raw_reward metadata
+
+Aborted/unscored samples keep reward=None and never meet the reward hook,
+so (a) key extraction crashed on None['key'] in both eval collection twins
+and get_reward_value instead of flowing into none_reward_ratio accounting,
+and (b) the metadata raw_reward paths gated on samples[0] then crashed on
+the first unscored sample without the key. Pass None through and fall back
+per sample.
+---
+ miles/ray/rollout/metrics.py                             | 7 ++++++-
+ miles/ray/rollout/train_data_conversion.py               | 9 +++++++--
+ .../rollout/inference_rollout/inference_rollout_eval.py  | 7 ++++++-
+ miles/rollout/sglang_rollout.py                          | 7 ++++++-
+ miles/utils/types.py                                     | 4 ++++
+ 5 files changed, 29 insertions(+), 5 deletions(-)
+
+diff --git a/miles/ray/rollout/metrics.py b/miles/ray/rollout/metrics.py
+index ded44d49b..77a6377c9 100644
+--- a/miles/ray/rollout/metrics.py
++++ b/miles/ray/rollout/metrics.py
+@@ -207,7 +207,12 @@ def _compute_training_sample_metrics(args: Any, samples: list[Sample]) -> dict[s
+     for position, sample in enumerate(samples):
+         rollout_key = _get_rollout_key(sample, position)
+ 
+-        raw_reward = sample.metadata["raw_reward"] if use_metadata_reward else sample.get_reward_value(args)
++        # Per-sample fallback: aborted/unscored samples never met the reward
++        # hook and carry no raw_reward even when the batch as a whole does.
++        if use_metadata_reward and "raw_reward" in (sample.metadata or {}):
++            raw_reward = sample.metadata["raw_reward"]
++        else:
++            raw_reward = sample.get_reward_value(args)
+         if isinstance(raw_reward, Number):
+             rewards_by_rollout.setdefault(rollout_key, []).append(raw_reward)
+ 
+diff --git a/miles/ray/rollout/train_data_conversion.py b/miles/ray/rollout/train_data_conversion.py
+index bfc62c4cb..4044cabdf 100644
+--- a/miles/ray/rollout/train_data_conversion.py
++++ b/miles/ray/rollout/train_data_conversion.py
+@@ -107,9 +107,14 @@ def convert_samples_to_train_data(
+ 
+     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
+ 
+-    # overwriting the raw reward
++    # overwriting the raw reward; unscored samples fall back to the reward key
+     if samples[0].metadata and "raw_reward" in samples[0].metadata:
+-        train_data["raw_reward"] = [sample.metadata["raw_reward"] for sample in samples]
++        train_data["raw_reward"] = [
++            sample.metadata["raw_reward"]
++            if "raw_reward" in (sample.metadata or {})
++            else sample.get_reward_value(args)
++            for sample in samples
++        ]
+ 
+     # For rollout buffer
+     if samples[0].metadata and "round_number" in samples[0].metadata:
+diff --git a/miles/rollout/inference_rollout/inference_rollout_eval.py b/miles/rollout/inference_rollout/inference_rollout_eval.py
+index f87347df0..5020375c7 100644
+--- a/miles/rollout/inference_rollout/inference_rollout_eval.py
++++ b/miles/rollout/inference_rollout/inference_rollout_eval.py
+@@ -126,7 +126,12 @@ async def eval_rollout_single_dataset(
+     reward_key = args.eval_reward_key or args.reward_key
+     return {
+         dataset_cfg.name: {
+-            "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
++            "rewards": [
++                # None (aborted/unscored) stays None: log_eval_rollout_data
++                # counts it in none_reward_ratio and coerces 0.0 for the mean.
++                sample.reward if not reward_key or sample.reward is None else sample.reward[reward_key]
++                for sample in data
++            ],
+             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
+             "samples": data,
+         }
+diff --git a/miles/rollout/sglang_rollout.py b/miles/rollout/sglang_rollout.py
+index cd859361e..b9874ace6 100644
+--- a/miles/rollout/sglang_rollout.py
++++ b/miles/rollout/sglang_rollout.py
+@@ -686,7 +686,12 @@ async def eval_rollout_single_dataset(
+     reward_key = args.eval_reward_key or args.reward_key
+     return {
+         dataset_cfg.name: {
+-            "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
++            "rewards": [
++                # None (aborted/unscored) stays None: log_eval_rollout_data
++                # counts it in none_reward_ratio and coerces 0.0 for the mean.
++                sample.reward if not reward_key or sample.reward is None else sample.reward[reward_key]
++                for sample in data
++            ],
+             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
+             "samples": data,
+         }
+diff --git a/miles/utils/types.py b/miles/utils/types.py
+index 0f406bdd9..679a862e9 100644
+--- a/miles/utils/types.py
++++ b/miles/utils/types.py
+@@ -234,6 +234,10 @@ class Sample:
+         return sample
+ 
+     def get_reward_value(self, args) -> float:
++        # None (aborted/unscored) passes through under a reward_key too, matching
++        # the scalar behavior; consumers already handle None rewards.
++        if self.reward is None:
++            return None
+         return self.reward if not args.reward_key else self.reward[args.reward_key]
+ 
+     @property

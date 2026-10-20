@@ -1,0 +1,34 @@
+[project]
+name = "alfworld-env-server"
+version = "0.0.1"
+# Matches nemo-gym's own pin (>=3.13.14), which makes `uv run --project`
+# resolvable here. py3.13 needs the _tw_compat patches (validated: alfworld
+# 0.4.2 / textworld 1.7.0 / tatsu 5.8.3 with py3.13).
+requires-python = ">= 3.13.14"
+dependencies = [
+    "nemo-gym[dev]",
+    "alfworld>=0.4.0",
+    # Shared session-Gymnasium base (gym_root/agent_utils/session_gym.py).
+    "miles-agent-utils",
+]
+
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools >= 61", "setuptools-scm"]
+
+# Package name is alfworld_env, NOT alfworld: the server package must not
+# shadow the PyPI alfworld dependency inside the same venv.
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["alfworld_env"]
+
+# 3 levels up = repo root; Gym is the pinned submodule there. agent_utils is
+# the sibling overlay package (the venv builder installs it editable too, see
+# scripts/build_gym_venvs.sh; tests import it via conftest).
+[tool.uv.sources]
+nemo-gym = { path = "../../../3rdparty/Gym", editable = true}
+miles-agent-utils = { path = "../../agent_utils", editable = true }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

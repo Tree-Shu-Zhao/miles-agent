@@ -1,0 +1,9 @@
+# Marker file only - not a real project.
+#
+# nemo_gym's setup_command decides between editable-install mode and
+# PyPI-install mode by checking whether <server_dir>/../../pyproject.toml
+# exists (nemo_gym/cli/setup_command.py, is_editable_install). Without this
+# marker, servers under this external gym root would install nemo-gym from
+# PyPI (version-skewed against the staged tree, --no-sources); with it, each
+# server venv gets `uv pip install -e .`, which honors the server's
+# [tool.uv.sources] editable path to the pinned 3rdparty/Gym submodule.

@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shu Zhao <shuzhao.cs@gmail.com>
+Date: Sat, 29 Aug 2026 18:58:22 -0700
+Subject: [PATCH] feat: aggregate metadata env_metrics into env/* rollout and
+ eval metrics
+
+Environment-error counters (policy_400_truncated, tool_errors,
+run_transport_failed) reported by the agent function ride
+sample.metadata["env_metrics"]; _compute_metrics_from_samples means them
+over the full sample set so failures are wandb metrics, not log lines.
+---
+ miles/ray/rollout/metrics.py | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/miles/ray/rollout/metrics.py b/miles/ray/rollout/metrics.py
+index 59c015bc1..ded44d49b 100644
+--- a/miles/ray/rollout/metrics.py
++++ b/miles/ray/rollout/metrics.py
+@@ -145,6 +145,15 @@ def _compute_metrics_from_samples(args, samples):
+             # assistant_text mismatch is non-critical: assistant tokens are inherited
+             # from the pretokenized prefix and may differ from canonical tokenization.
+ 
++    # Environment-error counters reported by the agent function under
++    # metadata["env_metrics"] (e.g. policy_400_truncated, tool_errors,
++    # run_transport_failed). A sample missing a key counts as 0 so every
++    # env/* metric is a mean over the full sample set.
++    env_keys = {key for s in samples for key in (s.metadata.get("env_metrics") or {})}
++    for key in sorted(env_keys):
++        values = [float((s.metadata.get("env_metrics") or {}).get(key, 0)) for s in samples]
++        log_dict[f"env/{key}"] = np.mean(values).item()
++
+     return log_dict
+ 
+ 

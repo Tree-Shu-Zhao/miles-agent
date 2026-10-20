@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shu Zhao <shuzhao.cs@gmail.com>
+Date: Mon, 31 Aug 2026 16:52:38 -0700
+Subject: [PATCH] fix: save models while resident in sync/async drivers
+ (offload-train zero-weight ckpts)
+
+With --offload-train, miles force-disables the param-buffer CPU backup
+(arguments.py), so torch_memory_saver.pause() discards bf16 param
+contents; wake_up() remaps fresh zero pages and only the next train
+step's weights_backuper restore refills them. Both drivers' use_critic
+branches offloaded the just-trained model BEFORE the save gate, so
+save_checkpoint serialized all-zero bf16 weights while the separately
+backed-up optimizer state stayed real - silent corruption, discovered
+when every colocated-PPO checkpoint exported as zeros (colo1n_ppo_r1,
+all 10 saves; weights recovered offline from fp32 main params).
+
+Fix: decide the save before training and call save_model inline while
+each model is still resident - the exact pattern the criticless branch
+already used (which is why GRPO checkpoints were never affected).
+---
+ train.py       | 43 +++++++++++++++++++++++--------------------
+ train_async.py | 36 ++++++++++++++++++++++--------------
+ 2 files changed, 45 insertions(+), 34 deletions(-)
+
+diff --git a/train.py b/train.py
+index b9446037d..93b90984f 100644
+--- a/train.py
++++ b/train.py
+@@ -74,21 +74,12 @@ async def train(args, *, disposer: Disposer):
+         else:
+             await actor_model.clear_memory()
+ 
+-    async def save(rollout_id, force_sync=False):
+-        force_sync = force_sync or rollout_id == args.num_rollout - 1
+-
+-        async def save_training_model(model):
+-            if args.use_critic and args.offload_train:
+-                await model.onload()
+-            await model.save_model(rollout_id, force_sync=force_sync)
+-            if args.use_critic and args.offload_train:
+-                await model.offload()
+-
+-        if (not args.use_critic) or (rollout_id >= args.num_critic_only_steps):
+-            await save_training_model(actor_model)
+-        if args.use_critic:
+-            await save_training_model(critic_model)
+-        await rollout_executor.save(rollout_id)
++    def save_due(rollout_id):
++        external = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
++        due = external or should_run_periodic_action(
++            rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
++        )
++        return external, due
+ 
+     if args.num_rollout > args.start_rollout_id and args.eval_interval is not None and not args.skip_eval_before_train:
+         await inference_controller.prepare_eval()
+@@ -116,24 +107,36 @@ async def train(args, *, disposer: Disposer):
+                     offload_tags.append(GPU_MEMORY_TYPE_WEIGHTS)
+                 await inference_controller.offload(tags=offload_tags)
+ 
++        # Each model must be saved while its weights are still resident: with
++        # --offload-train the param-buffer CPU backup is disabled, so an
++        # offloaded model onloads to freshly-mapped (zero) pages and only the
++        # next train step's backup restore refills them. Saving after offload
++        # serializes zero bf16 weights (optimizer state, separately backed up,
++        # stays real). Decide the save before training and save inline.
++        external_save, do_save = save_due(rollout_id)
++        force_sync = external_save or rollout_id == args.num_rollout - 1
++
+         if args.use_critic:
+             values = await critic_model.train(rollout_id, rollout_data_pack)
++            if do_save:
++                await critic_model.save_model(rollout_id, force_sync=force_sync)
+             if args.offload_train:
+                 await critic_model.offload()
+             if rollout_id >= args.num_critic_only_steps:
+                 await actor_model.train(rollout_id, rollout_data_pack, external_data=values)
++                if do_save:
++                    await actor_model.save_model(rollout_id, force_sync=force_sync)
+                 if args.offload_train:
+                     await actor_model.offload()
+             remove_train_output_refs(values)
+         else:
+             await actor_model.train(rollout_id, rollout_data_pack)
++            if do_save:
++                await actor_model.save_model(rollout_id, force_sync=force_sync)
+         remove_rollout_data_refs(args, rollout_data_pack)
+ 
+-        external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
+-        if external_save or should_run_periodic_action(
+-            rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
+-        ):
+-            await save(rollout_id, force_sync=external_save)
++        if do_save:
++            await rollout_executor.save(rollout_id)
+             if external_save:
+                 os.remove(args.save_trigger_sentinel)
+ 
+diff --git a/train_async.py b/train_async.py
+index d8cb41b1f..0475a64b5 100644
+--- a/train_async.py
++++ b/train_async.py
+@@ -55,12 +55,12 @@ async def train(args, *, disposer: Disposer):
+         await inference_controller.prepare_eval()
+         await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint)
+ 
+-    async def save_training_model(model, rollout_id, force_sync):
+-        if args.use_critic and args.offload_train:
+-            await model.onload()
+-        await model.save_model(rollout_id, force_sync=force_sync)
+-        if args.use_critic and args.offload_train:
+-            await model.offload()
++    def save_due(rollout_id):
++        external = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
++        due = external or should_run_periodic_action(
++            rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
++        )
++        return external, due
+ 
+     async def prepare_and_generate(rollout_id):
+         await inference_controller.prepare_rollout(rollout_id)
+@@ -82,27 +82,35 @@ async def train(args, *, disposer: Disposer):
+         if has_next_rollout and not defer_next_drain:
+             rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
+ 
++        # Each model must be saved while its weights are still resident: with
++        # --offload-train the param-buffer CPU backup is disabled, so an
++        # offloaded model onloads to freshly-mapped (zero) pages and only the
++        # next train step's backup restore refills them. Saving after offload
++        # serializes zero bf16 weights (optimizer state, separately backed up,
++        # stays real). Decide the save before training and save inline.
++        external_save, do_save = save_due(rollout_id)
++        force_sync = external_save or rollout_id == args.num_rollout - 1
++
+         if args.use_critic:
+             values = await critic_model.train(rollout_id, rollout_data_curr_ref)
++            if do_save:
++                await critic_model.save_model(rollout_id, force_sync=force_sync)
+             if args.offload_train:
+                 await critic_model.offload()
+             if rollout_id >= args.num_critic_only_steps:
+                 await actor_model.train(rollout_id, rollout_data_curr_ref, external_data=values)
++                if do_save:
++                    await actor_model.save_model(rollout_id, force_sync=force_sync)
+                 if args.offload_train:
+                     await actor_model.offload()
+             remove_train_output_refs(values)
+         else:
+             await actor_model.train(rollout_id, rollout_data_curr_ref)
++            if do_save:
++                await actor_model.save_model(rollout_id, force_sync=force_sync)
+         remove_rollout_data_refs(args, rollout_data_curr_ref)
+ 
+-        external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
+-        if external_save or should_run_periodic_action(
+-            rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
+-        ):
+-            force_sync = external_save or rollout_id == args.num_rollout - 1
+-            await save_training_model(actor_model, rollout_id, force_sync)
+-            if args.use_critic:
+-                await save_training_model(critic_model, rollout_id, force_sync)
++        if do_save:
+             await rollout_executor.save(rollout_id)
+             if external_save:
+                 os.remove(args.save_trigger_sentinel)

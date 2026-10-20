@@ -1,0 +1,9 @@
+6fbea75b95f21eed256848882fa4f0177f085fce  miles-env-metrics.patch
+4fd523f94eb32351034eaa1616d6615c37ae12ec  miles-reward-key-none-safe.patch
+13f24b7f45396a8d6df063ebba9d8ab19d63b1e1  miles-save-while-resident.patch
+7579f9bacf04935211c42f2cdf2ca863192988c4  miles-session-text-parts.patch
+6115655307872a286e28acfda1bc0cd78085b272  miles-preempt-save.patch
+3978e8e0cbfd4b0dd09e371cf2596f13945727e7  miles-fp32-lm-head.patch
+b6e94bbcec7d9743238325ab6358c779eb1ce27d  miles-fp32-lm-head-hybrid.patch
+935c7e468dd65350b26a5fe50dbf15bed6c0c3d4  miles-mamba-packed-seq-idx.patch
+3d3c1951ce3773bf3869de59e213a0fad003952e  miles-qwen3.5-2B-model-args.patch

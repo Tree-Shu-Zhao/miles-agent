@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shu Zhao <shuzhao.cs@gmail.com>
+Date: Thu, 15 Oct 2026 18:48:34 -0700
+Subject: [PATCH] fix: seq_idx for packed sequences through Mamba layers
+
+Megatron's Mamba mixer keeps packed sequences apart only through
+PackedSeqParams.seq_idx (its fused conv + scan kernel restarts the conv
+and SSM states at each new index), and PackedSeqParams derives seq_idx
+only when given total_tokens. get_packed_seq_params gave neither, so in a
+micro-batch of several samples every sample after the first started from
+the previous sample's conv and SSM states instead of zero. Attention and
+MoE layers were unaffected (cu_seqlens; per token). It now sets seq_idx
+from the packed boundaries, sized by the host's total so that building it
+does not sync the device.
+---
+ miles/backends/megatron_utils/parallel.py     | 17 +++++++++++
+ .../megatron_utils/test_packed_seq_idx.py     | 28 +++++++++++++++++++
+ 2 files changed, 45 insertions(+)
+ create mode 100644 tests/fast/backends/megatron_utils/test_packed_seq_idx.py
+
+diff --git a/miles/backends/megatron_utils/parallel.py b/miles/backends/megatron_utils/parallel.py
+index 3034e5766..686bbfef0 100644
+--- a/miles/backends/megatron_utils/parallel.py
++++ b/miles/backends/megatron_utils/parallel.py
+@@ -108,6 +108,19 @@ class PackedSeqParamsWithHostCuSeqlens(PackedSeqParams):
+     cu_seqlens_host: tuple[int, ...] = field(kw_only=True)
+ 
+ 
++def _packed_seq_idx(cu_seqlens: torch.Tensor, total_tokens: int) -> torch.Tensor:
++    """Each packed token's sequence index, ``[1, total_tokens]`` int32: ``PackedSeqParams.seq_idx``.
++
++    Megatron's Mamba mixer keeps packed sequences apart only through ``seq_idx`` (its conv and SSM kernels restart
++    at each new index); ``PackedSeqParams`` derives it only when given ``total_tokens``, and without it a sequence's
++    conv and SSM states run on into the next one's. ``total_tokens`` (the host's last boundary) sizes the output, so
++    building it does not sync the device.
++    """
++    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
++    index = torch.arange(lengths.numel(), device=cu_seqlens.device, dtype=torch.int32)
++    return torch.repeat_interleave(index, lengths, output_size=total_tokens).unsqueeze(0)
++
++
+ def get_packed_seq_params(batch: dict[str, torch.Tensor], args: Namespace) -> PackedSeqParams:
+     if args.qkv_format == "thd":
+         packed_seq_params = PackedSeqParamsWithHostCuSeqlens(
+@@ -118,6 +131,10 @@ def get_packed_seq_params(batch: dict[str, torch.Tensor], args: Namespace) -> Pa
+             qkv_format="thd",
+             cu_seqlens_host=batch["cu_seqlens_host"],
+         )
++        # get_batch's boundaries end at the packed (padded) length, so every token, padding included, has an index
++        packed_seq_params.seq_idx = _packed_seq_idx(
++            cu_seqlens=batch["cu_seqlens"], total_tokens=batch["cu_seqlens_host"][-1]
++        )
+         batch["packed_seq_params"] = packed_seq_params
+         return packed_seq_params
+     else:
+diff --git a/tests/fast/backends/megatron_utils/test_packed_seq_idx.py b/tests/fast/backends/megatron_utils/test_packed_seq_idx.py
+new file mode 100644
+index 000000000..da5c60454
+--- /dev/null
++++ b/tests/fast/backends/megatron_utils/test_packed_seq_idx.py
+@@ -0,0 +1,28 @@
++from argparse import Namespace
++
++import torch
++
++from miles.backends.megatron_utils.parallel import get_packed_seq_params
++
++
++def test_packed_seq_params_carry_each_tokens_sequence_index():
++    # three sequences and five tokens of padding, as get_batch packs them
++    batch = {
++        "cu_seqlens": torch.tensor([0, 5, 7, 11, 16], dtype=torch.int),
++        "cu_seqlens_host": (0, 5, 7, 11, 16),
++        "max_seqlen": 5,
++    }
++    params = get_packed_seq_params(batch, Namespace(qkv_format="thd"))
++    assert params.seq_idx.dtype == torch.int32
++    assert params.seq_idx.tolist() == [[0] * 5 + [1] * 2 + [2] * 4 + [3] * 5]
++    assert batch["packed_seq_params"] is params
++
++
++def test_a_single_sequence_is_index_zero_throughout():
++    batch = {"cu_seqlens": torch.tensor([0, 9], dtype=torch.int), "cu_seqlens_host": (0, 9), "max_seqlen": 9}
++    params = get_packed_seq_params(batch, Namespace(qkv_format="thd"))
++    assert params.seq_idx.tolist() == [[0] * 9]
++
++
++def test_unpacked_batches_have_no_packed_seq_params():
++    assert get_packed_seq_params({}, Namespace(qkv_format="bshd")) is None

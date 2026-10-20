@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite it as below."
+title: "miles-agent"
+type: software
+authors:
+  - family-names: Zhao
+    given-names: Shu
+repository-code: "https://github.com/Tree-Shu-Zhao/miles-agent"
+license: Apache-2.0

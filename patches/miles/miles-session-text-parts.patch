@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shu Zhao <shuzhao.cs@gmail.com>
+Date: Mon, 12 Oct 2026 11:48:09 -0700
+Subject: [PATCH] fix(session): flatten text-only content-part lists like
+ SGLang
+
+Agent harnesses such as ProRL's OpenHands fork send message content in
+the OpenAI list form ([{"type": "text", "text": ...}]). SGLang renders a
+text-only list as the space-joined string, but the TITO templates read
+string content only: Qwen3's template concatenates a system message's
+content as a string, so a list there fails the render (a TypeError, so
+every OpenHands turn got a 500), and other list content renders as ''.
+The session also matches stored history against string content.
+
+flatten_text_part_messages flattens text-only part lists to that string;
+any other content passes through. resolve_request_args_by_config applies
+it to the forwarded body with the other server rules, and both session
+versions apply it to the messages they match history against and render
+input_ids from.
+
+The client-reply half of the former session-client-view patch (no
+logprobs / meta_info unless asked) is upstream since #3877 and #3716.
+---
+ miles/rollout/session/linear_trajectory.py    |  9 +++--
+ miles/rollout/session/request_args.py         | 26 ++++++++++++++
+ miles/rollout/session/v2/session_state.py     |  9 +++--
+ .../fast/router/test_session_v1_v2_parity.py  | 36 +++++++++++++++++++
+ 4 files changed, 76 insertions(+), 4 deletions(-)
+
+diff --git a/miles/rollout/session/linear_trajectory.py b/miles/rollout/session/linear_trajectory.py
+index c334f17d6..2d118fdda 100644
+--- a/miles/rollout/session/linear_trajectory.py
++++ b/miles/rollout/session/linear_trajectory.py
+@@ -7,7 +7,11 @@ from typing import Any
+ 
+ from miles.rollout.session.config import SessionServerConfig
+ from miles.rollout.session.errors import MessageValidationError, SessionNotFoundError, TokenizationError
+-from miles.rollout.session.request_args import PreparedChatRequest, prepare_chat_request
++from miles.rollout.session.request_args import (
++    PreparedChatRequest,
++    flatten_text_part_messages,
++    prepare_chat_request,
++)
+ from miles.rollout.session.types import SessionRecord
+ from miles.utils.chat_template_utils.message_matcher_hub import (
+     SessionMessageMatcher,
+@@ -126,7 +130,8 @@ class LinearTrajectory:
+         The caller must hold `self.lock`.
+         """
+         matcher = message_matcher if message_matcher is not None else strict_message_matches
+-        request_messages = client_args.get("messages", [])
++        # the form the forwarded body and the stored history carry
++        request_messages = flatten_text_part_messages(client_args.get("messages", []))
+         checkpoint_index = self._find_rollback_checkpoint(request_messages, matcher)
+         turn_args = self.turn_args_history[checkpoint_index] if checkpoint_index >= 0 else None
+         prepared = prepare_chat_request(
+diff --git a/miles/rollout/session/request_args.py b/miles/rollout/session/request_args.py
+index d742dbca5..ddd150046 100644
+--- a/miles/rollout/session/request_args.py
++++ b/miles/rollout/session/request_args.py
+@@ -129,6 +129,30 @@ def apply_session_sampling_defaults(
+             )
+ 
+ 
++def _flatten_text_parts(message: Any) -> Any:
++    """A content-part list of text only (the OpenAI list form, which e.g. OpenHands
++    sends) becomes the string SGLang renders from it (space-joined, as in
++    ``process_content_for_template_format``). The TITO templates read string content
++    only (qwen3_fixed.jinja renders anything else as ''), and stored history is
++    matched against string content. Other messages pass through unchanged."""
++    content = message.get("content") if isinstance(message, dict) else None
++    if not isinstance(content, list) or not content:
++        return message
++    if not all(isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str) for p in content):
++        return message
++    return {**message, "content": " ".join(p["text"] for p in content)}
++
++
++def flatten_text_part_messages(messages: Any) -> Any:
++    """``_flatten_text_parts`` over a messages list; anything else passes through for
++    validation to report. The session matches history and renders input_ids from this
++    form too, not from the client's part lists: Qwen3's template concatenates a system
++    message's content as a string, so a part list there fails the render outright."""
++    if not isinstance(messages, list):
++        return messages
++    return [_flatten_text_parts(message) for message in messages]
++
++
+ def resolve_request_args_by_config(
+     request_args: dict[str, Any], config: SessionServerConfig, *, evaluation: bool = False
+ ) -> tuple[dict[str, Any], ClientResponseIntent]:
+@@ -185,6 +209,8 @@ def resolve_request_args_by_config(
+     # streaming intent for the response, but keep the backend request non-streaming.
+     client_stream = bool(request_args.pop("stream", False))
+     request_args.pop("stream_options", None)
++    if isinstance(request_args.get("messages"), list):
++        request_args["messages"] = flatten_text_part_messages(request_args["messages"])
+     kwargs = request_args.get("chat_template_kwargs")
+     if kwargs is not None and not isinstance(kwargs, dict):
+         raise MessageValidationError("chat_template_kwargs must be an object")
+diff --git a/miles/rollout/session/v2/session_state.py b/miles/rollout/session/v2/session_state.py
+index 7869397f5..5a1f565a6 100644
+--- a/miles/rollout/session/v2/session_state.py
++++ b/miles/rollout/session/v2/session_state.py
+@@ -28,7 +28,11 @@ from typing import Any
+ from miles.rollout.session.config import SessionServerConfig
+ from miles.rollout.session.errors import MessageValidationError, TokenizationError, TruncatedGenerationError
+ from miles.rollout.session.linear_trajectory import SessionRegistry, assert_pretokenized_prefix
+-from miles.rollout.session.request_args import PreparedChatRequest, prepare_chat_request
++from miles.rollout.session.request_args import (
++    PreparedChatRequest,
++    flatten_text_part_messages,
++    prepare_chat_request,
++)
+ from miles.rollout.session.types import SessionRecord
+ from miles.rollout.session.v2.tree_trajectory import AttachPoint, SessionTree, TrajectoryNode
+ from miles.utils.chat_template_utils.message_matcher_hub import SessionMessageMatcher
+@@ -99,7 +103,8 @@ def prepare_token_ids_and_request_args(
+     message_matcher: SessionMessageMatcher | None = None,
+ ) -> tuple[PreparedChatRequest, TrajectoryNode | None]:
+     """Return the prepared request with `body["input_ids"]` and its parent for `commit_generation`."""
+-    request_messages = client_args.get("messages", [])
++    # the form the forwarded body and the stored history carry
++    request_messages = flatten_text_part_messages(client_args.get("messages", []))
+     parent = attach_point_for_request(state, request_messages, message_matcher=message_matcher).node
+     prepared = prepare_chat_request(
+         client_args,
+diff --git a/tests/fast/router/test_session_v1_v2_parity.py b/tests/fast/router/test_session_v1_v2_parity.py
+index 494cc5f29..098899614 100644
+--- a/tests/fast/router/test_session_v1_v2_parity.py
++++ b/tests/fast/router/test_session_v1_v2_parity.py
+@@ -89,6 +89,42 @@ def test_aborted_generation_is_not_committed(version):
+             assert session["records"] == []
+ 
+ 
++@pytest.mark.parametrize("version", [V1, V2])
++def test_text_part_content_renders_as_sglang_string(version):
++    """OpenAI text-part lists (ProRL's OpenHands fork sends them) reach the TITO render,
++    not just the forwarded body, as SGLang's space-joined string. Qwen3's template
++    cannot concatenate a list-form system message at all, and renders other list
++    content as ''. A list-form replay continues the stored string history."""
++
++    def parts(*texts: str) -> list[dict]:
++        return [{"type": "text", "text": text} for text in texts]
++
++    def answer(_prompt: str) -> ProcessResult:
++        return ProcessResult(text="It is 4.", finish_reason="stop")
++
++    with with_mock_server(model_name=_MODEL, process_fn=answer) as backend:
++        with _serve_session(backend_url=backend.url, hf_checkpoint=_MODEL, version=version) as args:
++            session_url = args.session_server_instances[0].url
++            session_id = requests.post(f"{session_url}/sessions", timeout=5.0).json()["session_id"]
++            chat_url = f"{session_url}/sessions/{session_id}/v1/chat/completions"
++            messages = [
++                {"role": "system", "content": parts("Answer briefly.")},
++                {"role": "user", "content": parts("What is", "2+2?")},
++            ]
++
++            first = requests.post(chat_url, json={"messages": messages}, timeout=10.0)
++            assert first.status_code == 200, first.text
++            prompt = backend.tokenizer.decode(backend.request_log[-1]["input_ids"])
++            assert "Answer briefly." in prompt and "What is 2+2?" in prompt
++            assert backend.request_log[-1]["messages"][1]["content"] == "What is 2+2?"
++
++            followup = [*messages, first.json()["choices"][0]["message"], {"role": "user", "content": parts("And 3+3?")}]
++            second = requests.post(chat_url, json={"messages": followup}, timeout=10.0)
++            assert second.status_code == 200, second.text
++            prompt = backend.tokenizer.decode(backend.request_log[-1]["input_ids"])
++            assert "What is 2+2?" in prompt and "It is 4." in prompt and "And 3+3?" in prompt
++
++
+ @pytest.mark.parametrize("random_tool_ids", [False, True])
+ def test_agentic_v2_same_prompt_retries_match_v1_training_payload_bitwise(random_tool_ids, monkeypatch):
+     if random_tool_ids:

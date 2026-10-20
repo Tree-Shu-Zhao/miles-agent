@@ -1,0 +1,47 @@
+wiki_search:
+  resources_servers:
+    wiki_search:
+      entrypoint: app.py
+      domain: knowledge
+      verified: false
+      description: Wiki dense-retriever search environment - /search tool proxies a FlashRAG-style retriever, verify() does binary EM on the last <answer> block (Search-R1 style).
+      retriever_base_url: http://127.0.0.1:8000
+      top_k: 3
+      max_concurrency: 64
+      max_queries_per_call: 3
+      retriever_timeout_s: 30.0
+
+wiki_search_agent:
+  responses_api_agents:
+    tool_call_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: wiki_search
+      # Structural requirement of the base agent config; unused whenever the
+      # /run body carries policy_base_url (the Miles training path).
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      # episode turn budget = MODEL CALLS (each may issue tool calls). The
+      # nemo-rl baseline's simple_agent max_steps=4 counts TOOL ROUNDS, i.e.
+      # first call + 4 tool steps = 5 model calls; 5 here matches that.
+      max_turns: 5
+      datasets:
+        - name: example
+          type: example
+          jsonl_fpath: resources_servers/wiki_search/data/example.jsonl
+          # synthetic fixture rows authored in this repository (docs/data.md)
+          license: Apache 2.0
+        - name: train
+          type: train
+          jsonl_fpath: resources_servers/wiki_search/data/train.jsonl
+          # built locally by scripts/fetch_data.sh search_r1 from RUC-NLPIR/FlashRAG_datasets: nq (CC BY-SA 3.0)
+          # + hotpotqa (CC BY-SA 4.0); nemo_gym accepts one license name here, the share-alike one covers both (docs/data.md)
+          license: CC BY-SA 4.0
+        - name: validation
+          type: validation
+          jsonl_fpath: resources_servers/wiki_search/data/validation.jsonl
+          # built locally from FlashRAG_datasets: nq (CC BY-SA 3.0), triviaqa (Apache 2.0), popqa (MIT), hotpotqa (CC BY-SA 4.0),
+          # 2wikimultihopqa (Apache 2.0), musique (CC BY 4.0), bamboogle (MIT); one share-alike name for the mix (docs/data.md)
+          license: CC BY-SA 4.0

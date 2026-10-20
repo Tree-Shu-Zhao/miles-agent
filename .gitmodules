@@ -1,0 +1,7 @@
+[submodule "3rdparty/miles"]
+	path = 3rdparty/miles
+	url = https://github.com/radixark/miles.git
+	ignore = all
+[submodule "3rdparty/Gym"]
+	path = 3rdparty/Gym
+	url = https://github.com/NVIDIA-NeMo/Gym.git

@@ -1,0 +1,223 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shu Zhao <shuzhao.cs@gmail.com>
+Date: Thu, 15 Oct 2026 17:09:23 -0700
+Subject: [PATCH] feat: --fp32-lm-head for models without the output_processor
+ hook
+
+Megatron's HybridModel (what Megatron-Bridge builds for Nemotron-H) has no
+output_processor parameter, so passing the hook failed its forward.
+fp32_lm_head.hidden_states_out(model) now wraps each forward: a model
+whose forward takes the hook gets it as before (GPTModel); any other has
+its output layer return its input for the call, so the model's own
+logits.transpose(0, 1) hands back the final hidden states in the hook's
+[b, s, h] layout, and the output weight goes to the stash as the hook
+puts it. A model with MTP layers but no hook is refused: the MTP loss
+runs through the output layer before the logits do.
+---
+ miles/backends/megatron_utils/model.py        | 39 +++++-----
+ .../training_utils/loss/hub/fp32_lm_head.py   | 45 ++++++++++++
+ .../training_utils/loss/test_fp32_lm_head.py  | 72 +++++++++++++++++++
+ 3 files changed, 137 insertions(+), 19 deletions(-)
+
+diff --git a/miles/backends/megatron_utils/model.py b/miles/backends/megatron_utils/model.py
+index aaee8787e..6a60541e0 100644
+--- a/miles/backends/megatron_utils/model.py
++++ b/miles/backends/megatron_utils/model.py
+@@ -358,18 +358,19 @@ def forward_only(
+ 
+             set_tokens_per_adapter_slot(model, batch["adapter_token_counts"])
+ 
+-        output_tensor = model(
+-            input_ids=tokens,
+-            position_ids=None,
+-            attention_mask=None,
+-            labels=None,
+-            packed_seq_params=packed_seq_params,
+-            loss_mask=batch["input_loss_masks"],
+-            **(filter_keys(batch, ["witness_ids"]) if args.enable_witness else {}),
+-            **(batch["multimodal_train_inputs"] if batch["multimodal_train_inputs"] is not None else {}),
+-            **({"output_processor": fp32_lm_head.output_processor} if args.fp32_lm_head else {}),
+-            fp32_output=fp32_output,
+-        )
++        with fp32_lm_head.hidden_states_out(model) if args.fp32_lm_head else nullcontext({}) as head_kwargs:
++            output_tensor = model(
++                input_ids=tokens,
++                position_ids=None,
++                attention_mask=None,
++                labels=None,
++                packed_seq_params=packed_seq_params,
++                loss_mask=batch["input_loss_masks"],
++                **(filter_keys(batch, ["witness_ids"]) if args.enable_witness else {}),
++                **(batch["multimodal_train_inputs"] if batch["multimodal_train_inputs"] is not None else {}),
++                **head_kwargs,
++                fp32_output=fp32_output,
++            )
+ 
+         callback_kwargs = dict(
+             args=args,
+@@ -533,13 +534,13 @@ def run_forward_backward_pass(
+ 
+             if (x := batch["multimodal_train_inputs"]) is not None:
+                 forward_kwargs.update(x)
+-            if args.fp32_lm_head:
+-                # the hidden states instead of bf16 logits; the loss computes fp32 logits chunk by chunk
+-                forward_kwargs["output_processor"] = fp32_lm_head.output_processor
+-
+-            output_tensor = model(
+-                **forward_kwargs, fp32_output=args.loss_type not in ("policy_loss", "sft_loss", "score_centering")
+-            )
++            # --fp32-lm-head: the hidden states instead of bf16 logits; the loss computes fp32 logits chunk by chunk
++            with fp32_lm_head.hidden_states_out(model) if args.fp32_lm_head else nullcontext({}) as head_kwargs:
++                output_tensor = model(
++                    **forward_kwargs,
++                    **head_kwargs,
++                    fp32_output=args.loss_type not in ("policy_loss", "sft_loss", "score_centering"),
++                )
+ 
+         for m, old_stage in zip(all_replay_managers, old_stages, strict=True):
+             m.stage = old_stage
+diff --git a/miles/backends/training_utils/loss/hub/fp32_lm_head.py b/miles/backends/training_utils/loss/hub/fp32_lm_head.py
+index 329087b23..5c293adeb 100644
+--- a/miles/backends/training_utils/loss/hub/fp32_lm_head.py
++++ b/miles/backends/training_utils/loss/hub/fp32_lm_head.py
+@@ -12,8 +12,13 @@ Qwen3.5's 248,320-token vocabulary would be 69 GB, and their gradient as much ag
+ 
+ Tensor and context parallelism stay at 1: the weight is the whole vocabulary and the hidden states the whole
+ sequence.
++
++A model whose forward has no ``output_processor`` hook (Megatron's ``HybridModel``, which Megatron-Bridge builds for
++Nemotron-H) gets the same from ``hidden_states_out``: for the call, its output layer hands the final hidden states
++through as its "logits", which the model returns in the hook's ``[b, s, h]`` layout.
+ """
+ 
++import inspect
+ from contextlib import contextmanager
+ 
+ import torch
+@@ -53,6 +58,46 @@ def take_output_weight() -> torch.Tensor:
+     return weight
+ 
+ 
++def _core_model(model):
++    """The language model inside the DDP / Float16Module wrappers: the first module with an output layer."""
++    while not hasattr(model, "output_layer") and hasattr(model, "module"):
++        model = model.module
++    if not hasattr(model, "output_layer"):
++        raise NotImplementedError(f"--fp32-lm-head: {type(model).__name__} has no output layer")
++    return model
++
++
++@contextmanager
++def hidden_states_out(model):
++    """Around one forward of ``model``: the model hands back its final hidden states (``[b, s, h]``) in place of the
++    logits, and its output weight goes to ``_STASH``. Yields the extra forward kwargs: Megatron's ``output_processor``
++    hook for a model whose forward takes it (``GPTModel``); otherwise none, and the output layer itself returns its
++    input for the call, so the model's own ``logits.transpose(0, 1)`` gives the hook's layout. An MTP block computes
++    its loss through the output layer before the logits do, so such a model needs the hook."""
++    core = _core_model(model)
++    if "output_processor" in inspect.signature(type(core).forward).parameters:
++        yield {"output_processor": output_processor}
++        return
++    config = core.config
++    if getattr(config, "mtp_num_layers", None):
++        raise NotImplementedError(f"--fp32-lm-head: {type(core).__name__} has MTP layers but no output_processor hook")
++    if getattr(config, "use_mup", False):
++        raise NotImplementedError("--fp32-lm-head does not apply MuP's logit scaling")
++    layer = core.output_layer
++    if getattr(layer, "sequence_parallel", False):
++        raise NotImplementedError("--fp32-lm-head needs the whole sequence on the rank (no sequence parallelism)")
++
++    def forward(hidden_states, weight=None, runtime_gather_output=None, **_):
++        _STASH["weight"] = weight if weight is not None else layer.weight
++        return hidden_states, None
++
++    layer.forward = forward  # the instance attribute shadows the class's forward for this call only
++    try:
++        yield {}
++    finally:
++        del layer.forward
++
++
+ @contextmanager
+ def _tf32_matmuls():
+     previous = torch.backends.cuda.matmul.allow_tf32
+diff --git a/tests/fast/backends/training_utils/loss/test_fp32_lm_head.py b/tests/fast/backends/training_utils/loss/test_fp32_lm_head.py
+index dbec9ba16..d0f86c698 100644
+--- a/tests/fast/backends/training_utils/loss/test_fp32_lm_head.py
++++ b/tests/fast/backends/training_utils/loss/test_fp32_lm_head.py
+@@ -104,3 +104,75 @@ def test_output_processor_returns_hidden_states_and_stashes_the_weight():
+     assert fp32_lm_head.take_output_weight() is shared
+     fp32_lm_head.output_processor(hidden_states=hidden, output_layer=_Layer(), output_weight=None, config=_Config())
+     assert fp32_lm_head.take_output_weight() is _Layer.weight
++
++
++class _OutputLayer(torch.nn.Module):
++    sequence_parallel = False
++
++    def __init__(self):
++        super().__init__()
++        self.weight = torch.nn.Parameter(torch.randn(9, 4))
++
++    def forward(self, hidden_states, weight=None, runtime_gather_output=None):
++        return hidden_states @ (weight if weight is not None else self.weight).t(), None
++
++
++class _HybridLike(torch.nn.Module):
++    """As Megatron's HybridModel: no output_processor hook, logits from the output layer returned as [b, s, v]."""
++
++    def __init__(self, mtp_num_layers=None):
++        super().__init__()
++        self.config = SimpleNamespace(mtp_num_layers=mtp_num_layers, use_mup=False)
++        self.output_layer = _OutputLayer()
++
++    def forward(self, hidden_states, loss_mask=None):
++        logits, _ = self.output_layer(hidden_states, weight=None, runtime_gather_output=None)
++        return logits.transpose(0, 1).contiguous()
++
++
++class _GPTLike(_HybridLike):
++    def forward(self, hidden_states, loss_mask=None, output_processor=None):
++        raise AssertionError("not called")
++
++
++class _Wrapper(torch.nn.Module):
++    """As DDP and Float16Module: the model in .module."""
++
++    def __init__(self, module):
++        super().__init__()
++        self.module = module
++
++    def forward(self, *args, **kwargs):
++        return self.module(*args, **kwargs)
++
++
++def test_hidden_states_out_without_the_hook_returns_hidden_states_for_the_call_only():
++    core = _HybridLike()
++    model = _Wrapper(_Wrapper(core))
++    hidden = torch.randn(5, 1, 4)  # [s, b, h]
++    with fp32_lm_head.hidden_states_out(model) as kwargs:
++        assert kwargs == {}
++        out = model(hidden)
++    assert torch.equal(out, hidden.transpose(0, 1))  # output_processor's [b, s, h]
++    assert fp32_lm_head.take_output_weight() is core.output_layer.weight
++    assert model(hidden).shape == (1, 5, 9)  # the output layer's own forward again
++
++
++def test_hidden_states_out_restores_the_output_layer_after_an_error():
++    core = _HybridLike()
++    with pytest.raises(RuntimeError):
++        with fp32_lm_head.hidden_states_out(core):
++            raise RuntimeError("forward failed")
++    assert core(torch.randn(3, 1, 4)).shape == (1, 3, 9)
++
++
++def test_hidden_states_out_passes_the_hook_to_a_model_that_takes_it():
++    with fp32_lm_head.hidden_states_out(_Wrapper(_GPTLike())) as kwargs:
++        assert kwargs == {"output_processor": fp32_lm_head.output_processor}
++
++
++def test_hidden_states_out_refuses_mtp_layers_without_the_hook():
++    # their loss runs through the output layer before the logits do
++    with pytest.raises(NotImplementedError):
++        with fp32_lm_head.hidden_states_out(_HybridLike(mtp_num_layers=1)):
++            pass

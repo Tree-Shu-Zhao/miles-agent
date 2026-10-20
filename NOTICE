@@ -1,0 +1,67 @@
+NOTICE for miles-agent
+
+This repository is released under the Apache License, Version 2.0 (LICENSE). It contains or
+adapts code from the projects below, pins others as git submodules, and its scripts download
+datasets and install software whose licenses apply to what they fetch. Nothing listed here is
+relicensed.
+
+== Code vendored or adapted in this repository ==
+
+WebShop (github.com/princeton-nlp/WebShop) -- MIT License,
+  Copyright (c) 2023 Princeton Natural Language Processing.
+  env_servers/webshop/webshop/: the text-environment subset, verbatim (LICENSE.md inside).
+
+Search-R1 (github.com/PeterGriffinJin/Search-R1) -- Apache License 2.0.
+  gym_root/resources_servers/wiki_search/scoring.py adapts verl/utils/reward_score/qa_em.py
+  (Copyright 2024 Bytedance Ltd. and/or its affiliates; Apache License 2.0): normalize_answer,
+  em_check, extract_solution. The Search-R1 question prompt is reproduced in
+  gym_root/resources_servers/wiki_search/data/prepare.py and used by recipes/search_r1.
+
+TCOD (github.com/kokolerk/TCOD) -- Apache License 2.0.
+  gym_root/resources_servers/scienceworld_env/task_splits.py copies TASK_VARIATIONS and the
+  train/test task-type split of TCOD_examples/scienceworld/get_sciworld_data.py; the prompt
+  texts under prompts/ follow TCOD's templates; recipes/webshop/prepare_data.py's "tcod"
+  layout follows TCOD_examples/webshop/get_webshop_data.py.
+
+open-instruct (github.com/allenai/open-instruct) and TMax (github.com/hamishivi/tmax) --
+  Apache License 2.0.
+  gym_root/miles_harbor/miles_harbor/vanillux.py reproduces the vanillux agent prompts
+  (vanillux_prompts.yaml) verbatim; miles_agent/dppo.py follows open-instruct's grpo_utils.py
+  (see its docstring).
+
+== Projects pinned as git submodules (fetched by the user, not redistributed here) ==
+
+miles (github.com/radixark/miles) -- Apache License 2.0. 3rdparty/miles; the files under
+  patches/miles/ are modifications of miles sources and stay under its license.
+NeMo Gym (github.com/NVIDIA-NeMo/Gym) -- Apache License 2.0. 3rdparty/Gym; its
+  ATTRIBUTIONS.md lists its own third-party components.
+
+== Software the scripts install (licenses of the installed packages) ==
+
+ALFWorld (alfworld on PyPI) -- MIT License, Copyright (c) 2020 Mohit Shridhar and others.
+ScienceWorld (scienceworld on PyPI; the simulator jar ships in the wheel) -- Apache License 2.0.
+mini-swe-agent (github.com/SWE-agent/mini-swe-agent) -- MIT License,
+  Copyright (c) 2025 Kilian A. Lieret and Carlos E. Jimenez.
+  gym_root/miles_harbor/packs/miles_mini_ext.py extends its local environment class.
+Harbor (harbor on PyPI; github.com/laude-institute/harbor) -- Apache License 2.0.
+
+== Datasets the scripts download or that you obtain (never included here; docs/data.md) ==
+
+ALFWorld game files -- MIT License (alfworld-download).
+ScienceWorld tasks -- Apache License 2.0 (inside the scienceworld wheel). The evaluation task
+  list follows TCOD's split and is rebuilt locally (scripts/fetch_data.sh scienceworld).
+WebShop product catalog, and the goals the engine derives from it -- obtained from the WebShop
+  authors under their terms; the goal export is rebuilt locally (scripts/fetch_data.sh webshop
+  --regenerate-goals) and never redistributed from here.
+FlashRAG datasets (huggingface.co/datasets/RUC-NLPIR/FlashRAG_datasets), used by the Search-R1
+  recipe, per their original releases: Natural Questions (CC BY-SA 3.0), TriviaQA (Apache
+  License 2.0), PopQA (MIT), HotpotQA (CC BY-SA 4.0), 2WikiMultihopQA (Apache License 2.0),
+  MuSiQue (CC BY 4.0), Bamboogle (MIT). The train/validation files you build from them are
+  share-alike derivatives.
+TMax tasks (huggingface.co/datasets/allenai/tmax-15k-open-instruct) and the Harbor-registry
+  datasets the tmax recipe names -- under their own terms, fetched by recipes/tmax/prepare.py
+  and Harbor.
+
+The fixture rows under gym_root/resources_servers/*/data/example.jsonl are synthetic; the
+wiki_search rows carry Qwen's default system-prompt string. Model weights are governed by
+their own model licenses.

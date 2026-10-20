@@ -1,0 +1,5 @@
+# scripts/fetch_data.sh scienceworld writes the eval list here when SCIENCEWORLD_TEST_LIST
+# points here; it is never committed (docs/data.md): generator + digest only.
+scienceworld_test1308.jsonl
+scienceworld_test1308.jsonl.tmp
+scienceworld_test1308.jsonl.partial

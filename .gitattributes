@@ -1,0 +1,3 @@
+# the public tree is a `git archive` export (DESIGN D20/D21): these never leave the private repo
+reports/ export-ignore
+docs/agentic_rl_metrics.zh.md export-ignore
