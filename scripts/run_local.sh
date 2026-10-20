@@ -46,8 +46,8 @@
 # --num-gpus-per-node <gpus> ... --preempt-sentinel) -> RUN_INNER_PASS, or RUN_INNER_PREEMPT_STOP rc= durable= when
 # the sentinel was raised meanwhile (raised before the driver: "PREEMPT before launch", exit 0). The other ranks are
 # ray workers (RAY_WORKER_JOINED / RAY_WORKER_DONE, idle until $SYNC_DIR/ENDED) or the teacher node. TERM / USR1
-# raise the sentinel instead of killing the run. To stop a run: touch its sentinel; rerun the tag to resume from the
-# last checkpoint.
+# raise the sentinel instead of killing the run. To stop a run: touch its sentinel (the driver saves first); remove
+# it, then rerun the same tag to resume from that save.
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
