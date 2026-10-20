@@ -53,7 +53,7 @@ The student is then distilled from the repaired teacher under the unchanged OPD 
 - Linux, bash 4+, `git`, docker with GPU support (the training side runs in the miles image; `docs/containers.md`)
 - [uv](https://docs.astral.sh/uv/)
 - Machines of at least four GPUs (the topologies count four per node) with the same checkout, model and data paths and the ports 6379, 8265, 2000-2999 and 13141 open between them (`docs/local_setup.md`): one for the pilot, the pipeline, the fine-tuning and each decode; four for a student arm
-- One GPU must hold the whole teacher: it is served tensor-parallel 1 and data-parallel `TEACHER_DP` (4 in a student arm, 2 in the pipeline), every replica within 75 % of its GPU's memory (`TEACHER_MEM_FRAC`; the pipeline's teacher takes 80 %), which is about 18 GB of bf16 weights for Qwen3.5-9B and about 60 GB for Qwen3-30B-A3B-Instruct-2507
+- One GPU must hold the whole teacher: it is served tensor-parallel 1 and data-parallel `TEACHER_DP` (4 in a student arm, 2 in the pipeline), every replica within 75 % of its GPU's memory (`TEACHER_MEM_FRAC`; the pipeline's teacher takes 80 %), weights in bf16
 - Java 11 or newer for WebShop and ScienceWorld
 - Disk for the six base models (2B to 30B parameters) and the checkpoints you train (a 150-step arm saves every 25 steps)
 
