@@ -3,7 +3,8 @@ prose and Contract D table (one source for both repos; the wrapper repo is priva
 test diffs the three blocks against a checkout of that repo (`CLUSTER_JOBS_DIR`, default ~/Working/cluster-jobs) and
 skips when it is absent; the second checks, with no other checkout, that every Contract A name of
 tests/contract_vars.txt is a backticked token of the page's A table (and that the names file equals the wrapper
-repo's when that checkout is present)."""
+repo's when that checkout is present); the third checks that the three blocks cite files by repo-relative path,
+never by line number, and that every path they name exists."""
 import os
 import re
 from pathlib import Path
@@ -78,3 +79,69 @@ def test_cluster_doc_lists_every_contract_a_variable():
     theirs = _cluster_jobs() / "tests" / "contract_vars.txt"
     if theirs.is_file():
         assert VARS.read_text() == theirs.read_text()
+
+
+# A line-number citation inside a backticked span: a bare `:NN`, `:NN-NN` or `:NN,NN-NN`, or one right after a file
+# name (`x.sh:46`, `x.sh@<sha>:206`). A URL (`http://127.0.0.1:6100`) and a signal spec (`--signal=B:USR1@600`) are
+# not ones. The batch-file suffix is spelled in two pieces: the public-tree gate hunts the scheduler word.
+LINE_CITE = re.compile(r"^:\d+(?:[-,]\d+)*$|\.(?:sh|s" r"batch|py|env|md|yaml|toml|txt|patch)(?:@[0-9a-f]{7,})?:\d+")
+PATH_SUFFIXES = (".sh", ".s" "batch", ".py", ".env")
+WRAPPER_DIRS = ("lib/", "jobs/", "sandbox/", "projects/", "clusters/")  # the wrapper repo's top-level code dirs
+PLACEHOLDER_CHARS = "<>*${}"
+
+
+def _block_lines(text):
+    """The lines of the three shared blocks: the A table's `|` lines, the C prose, the D table's `|` lines."""
+    return _table(_section(text, "## A.")) + _section(text, "## C.") + _table(_section(text, "## D."))
+
+
+def _path_words(span):
+    """The words of a backticked span that name a file: trailing punctuation dropped, the part after a `=` taken
+    (`ENTRY=scripts/x.sh`), a word with a placeholder character skipped (`jobs/<job>.sh`, `$PROJECT_CODE_MOUNT/$ENTRY`),
+    and only the words ending in one of PATH_SUFFIXES kept (the other words of a command, `exec bash`, are not paths)."""
+    out = []
+    for word in span.split():
+        word = word.strip(",;:()").rsplit("=", 1)[-1]
+        if any(c in word for c in PLACEHOLDER_CHARS) or not word.endswith(PATH_SUFFIXES):
+            continue
+        out.append(word)
+    return out
+
+
+def _citation_problems(text, repo, wrapper):
+    """The offending spans of the shared blocks: line-number citations, and path words that resolve neither in `repo`
+    nor in the wrapper checkout `wrapper` (None = absent: a word under one of WRAPPER_DIRS cannot be checked then and
+    passes; any other unresolved word fails)."""
+    problems = []
+    for line in _block_lines(text):
+        for span in re.findall(r"`([^`]*)`", line):
+            if LINE_CITE.search(span):
+                problems.append(f"line-number citation: `{span}`")
+            for word in _path_words(span):
+                if (repo / word).is_file():
+                    continue
+                if wrapper is not None:
+                    if not (wrapper / word).is_file():
+                        problems.append(f"no such file in this repo or the wrapper checkout: `{word}`")
+                elif not word.startswith(WRAPPER_DIRS):
+                    problems.append(f"no such file in this repo: `{word}`")
+    return problems
+
+
+def test_cluster_doc_blocks_cite_files_not_lines():
+    """The shared blocks cite where a value or marker is produced and consumed as repo-relative paths with a function
+    or variable anchor, never a line number (the wrapper's old file names rotted with their line numbers, and a public
+    reader can open neither): no backticked span of the A table, the C prose or the D table is a bare `:NN` / `:NN-NN`
+    citation or carries one after a file name, and every backticked word ending in one of PATH_SUFFIXES is a file of
+    this repository or, when a wrapper checkout is present (CLUSTER_JOBS_DIR), of it. Tolerated on purpose: the other
+    words of a command (`exec bash`, `touch`), placeholders (`jobs/<job>.sh`, `$ENTRY`), a word's trailing punctuation
+    and an `ENTRY=<path>` assignment; without the wrapper checkout a word under its top-level code dirs (WRAPPER_DIRS)
+    is unverifiable and passes."""
+    wrapper = _cluster_jobs()
+    wrapper = wrapper if (wrapper / "runbooks" / "contract.md").is_file() else None
+    assert _citation_problems(DOC.read_text(), REPO, wrapper) == []
+    # the rules catch the old spellings and leave a URL, a signal spec, a command and a placeholder alone
+    assert LINE_CITE.search("x.sh:9,11-13") and LINE_CITE.search(":94-99") and LINE_CITE.search("x.sh@d4fbb87:206")
+    assert not LINE_CITE.search("http://127.0.0.1:6100") and not LINE_CITE.search("--signal=B:USR1@600")
+    assert _path_words("exec bash $PROJECT_CODE_MOUNT/$ENTRY") == [] and _path_words("jobs/<job>.sh") == []
+    assert _path_words("--env ENTRY=scripts/x.sh, lib/y.sh;") == ["scripts/x.sh", "lib/y.sh"]

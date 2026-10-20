@@ -28,29 +28,30 @@ Exported by the wrapper before the entry starts. The wrapper repository's `lib/j
 required name and passes the optional ones (`NEMO_GYM_URL TEACHER_URL RETRIEVER_URL ENTRY
 SESSION_SERVER_EXTERNAL_HOST SANDBOX_TRANSPORT`, the secrets) to the step only when they are set; the entries
 treat an empty optional as unset either way. The example wrapper below exports the subset the smallest job
-needs. The `today` column names where the old in-repo wrapper set each one.
+needs. The `source` column names where each value is produced (a file and function of the wrapper repository,
+which is private) and where the entries read it (a file of this repository), never a line number.
 
-| variable | value | today |
+| variable | value | source |
 |---|---|---|
-| `CONTRACT_VERSION` | 1; entry FATALs on an unknown major; unset = local mode | new |
-| `RUN_TAG` | `[A-Za-z0-9._-]+`, collision-guarded by the stage launcher | `miles_run.sbatch:72` |
-| `JOB_ID JOB_RESTART JOB_NAME` | `SLURM_JOB_ID`, `SLURM_RESTART_COUNT` (0), `SLURM_JOB_NAME`; the entry never reads `SLURM_*` | `:84` |
-| `NNODES NODE_RANK HEAD_IP NODE_IP` | node count, rank, head and own IPv4; entry validates `TOPOLOGY` vs `NNODES` itself (ex `:86-90`) | `:106-108`; `miles_run_inner.sh:9,11-13` |
-| `GPUS_PER_NODE` | `SLURM_GPUS_ON_NODE` else profile `GPUS_PER_NODE`; entry measures when unset | `miles_run_inner.sh:46` |
-| `PROJECT_DIR` + `MODELS_DIR DATA_DIR RESULTS_DIR RUNS_DIR TOOLS_DIR IMAGES_DIR STAGE_TARS_DIR` | `$PROJECT_DIR/{models,data,results,runs,tools,images,stage_tars}` (= `$P` today) | `:64`; `miles_run_inner.sh:351-357` |
-| `CACHE_DIR HF_HOME HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 NO_EGRESS=1` | hub cache + offline; entry never downloads under `NO_EGRESS` | `miles_run_inner.sh:39-40` |
-| `NODE_LOCAL` | `$LOCAL_BASE/<word>-$JOB_ID`, removed by the wrapper at exit | `:80`; `stale_sweep.sh:8-9` |
-| `TMPDIR TRITON_CACHE_DIR TORCHINDUCTOR_CACHE_DIR TRITON_PTXAS_PATH NCCL_*` | from profile `HW_ENV`; entry never sets them | `miles_run_inner.sh:33-38` |
-| `STAGE_DIR STAGE_SHA INFRA_SHA` | `$PROJECT_DIR/jobs/<stage>`, project tar sha (EXPECT_SHA-verified `:94-99`), cluster-jobs sha | `sbatch_stage.sh:24` |
-| `SYNC_DIR` | per job+restart; files `ENDED preempt preempt.done TEACHER_URL TEACHER_FAILED env_lost` | `:84`; `miles_run_inner.sh:52,62,69` |
-| `PREEMPT_SENTINEL` | `$SYNC_DIR/preempt` (D16) | `preempt.sh:26-27` |
-| `WANDB_API_KEY HF_TOKEN` | from `PROJECT_SECRETS="wandb_key:WANDB_API_KEY hf_token:HF_TOKEN"` via `jc_secret` under `set +x`; unset when `WANDB_ENABLE=0` | `miles_run_inner.sh:544-549` |
-| `NEMO_GYM_URL` (opt) | preset => external agent server(s), entry starts no gym | `swe_run_inner.sh:370-372`; `gym_bridge.py:17-19` |
-| `TEACHER_URL` (opt), `RETRIEVER_URL` (opt) | external teacher; the wrapper's tailnet bridge sets `RETRIEVER_URL=http://127.0.0.1:6100` | `miles_run_inner.sh:206-266` |
-| `GYM_VENV_ROOT` (opt) | `/opt` on the cluster (D6); unset => `uv run` online path | `miles_run.sbatch:138-142` |
-| `ENTRY` (opt, submitter) | overrides `PROJECT_ENTRY` (`--env ENTRY=scripts/r2s_teacher_ft.sh`) | new |
-| `SESSION_SERVER_EXTERNAL_HOST` (opt) | the training node's address the sandboxed agents dial back to; set by `jobs/run_sandboxed_inner.sh` (S4) | `swe_run_inner.sh` (S4) |
-| `SANDBOX_TRANSPORT` (opt) | `cluster` or `tailnet`: the Contract E transport the sandbox-env job was reached by (S4) | `swe_env_client.sh:1-25`; `swe_env_ctl.py` |
+| `CONTRACT_VERSION` | 1; entry FATALs on an unknown major; unset = local mode | `lib/job_common.sh` `jc_prologue`; `scripts/lib/common.sh` `contract_check` |
+| `RUN_TAG` | `[A-Za-z0-9._-]+`, collision-guarded by the stage launcher | `lib/sbatch_stage.sh` (exported from the launch line), `lib/job_common.sh` `jc_prologue` (the shape check); `scripts/run_local.sh` `--run-tag`, `scripts/lib/common.sh` `run_dirs` |
+| `JOB_ID JOB_RESTART JOB_NAME` | `SLURM_JOB_ID`, `SLURM_RESTART_COUNT` (0), `SLURM_JOB_NAME`; the entry never reads `SLURM_*` | `lib/job_common.sh` `jc_prologue`; `scripts/lib/common.sh` (`JOB_ID`, the log suffixes; the other two are not read by the entries) |
+| `NNODES NODE_RANK HEAD_IP NODE_IP` | node count, rank, head and own IPv4; entry validates `TOPOLOGY` vs `NNODES` itself | `lib/job_common.sh` `jc_prologue` (`NNODES HEAD_IP`), `jobs/run_inner.sh`, `jobs/run_sandboxed_inner.sh` (`NODE_RANK NODE_IP`, per task); `scripts/run_local.sh`, `scripts/lib/common.sh` `node_ip` |
+| `GPUS_PER_NODE` | `SLURM_GPUS_ON_NODE` else profile `GPUS_PER_NODE` else 0, always exported; the entry measures only when unset (local mode) | `lib/job_common.sh` `jc_prologue`; `scripts/lib/common.sh` `measure_gpus` |
+| `PROJECT_DIR` + `MODELS_DIR DATA_DIR RESULTS_DIR RUNS_DIR TOOLS_DIR IMAGES_DIR STAGE_TARS_DIR` | `$PROJECT_DIR/{models,data,results,runs,tools,images,stage_tars}` (= `$P` today) | `lib/job_common.sh` `jc_project` (`PROJECT_DIR` from the adapter's `projects/<name>/project.env`); `scripts/lib/common.sh` (the roots, `RUNS_DIR`, `scienceworld_java_home`; `IMAGES_DIR STAGE_TARS_DIR` are the wrapper's own) |
+| `CACHE_DIR HF_HOME HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 NO_EGRESS` | hub cache + offline; `NO_EGRESS` is 1 unless the profile's `EGRESS` lists the GPU nodes; entry never downloads under `NO_EGRESS` | `lib/job_common.sh` `jc_project` (`CACHE_DIR HF_HOME`), `lib/gpu_env.sh` `jc_gpu_env` (the offline flags, `NO_EGRESS`); `scripts/smoke_tests.sh` (`HF_HOME`), the hub libraries |
+| `NODE_LOCAL` | `$LOCAL_BASE/<word>-$JOB_ID`, removed by the wrapper at exit | `lib/job_common.sh` `jc_prologue`, `jobs/run.sbatch` `job_cleanup` (the removal), `lib/stale_sweep.sh` (the sweep); `scripts/r2s_teacher_ft.sh` (its scratch) |
+| `TMPDIR TRITON_CACHE_DIR TORCHINDUCTOR_CACHE_DIR TRITON_PTXAS_PATH NCCL_*` | `TMPDIR TRITON_PTXAS_PATH NCCL_*` from the profile's `HW_ENV`, the two JIT caches under `$NODE_LOCAL/jit/`; the training entry sets none of them | `lib/gpu_env.sh` `jc_gpu_env`; read by the engines and the compilers |
+| `STAGE_DIR STAGE_SHA INFRA_SHA` | `$PROJECT_DIR/jobs/<stage>`, project tar sha (EXPECT_SHA-verified), cluster-jobs sha | `lib/sbatch_stage.sh` (`STAGE_DIR`), `lib/job_common.sh` `jc_stage_gate` (the two shas, `STAGE_SHA_OK`); read by the wrapper's own jobs, not by the entries |
+| `SYNC_DIR` | per job+restart; files `ENDED preempt preempt.done TEACHER_URL TEACHER_FAILED env_lost` | `lib/job_common.sh` `jc_project`; `scripts/lib/common.sh` `run_dirs`, `scripts/lib/ray.sh` (`ENDED`), `scripts/teacher_node.sh` (`TEACHER_URL TEACHER_FAILED`); `env_lost` by the sandbox-env watchers (`sandbox/env_job/sandbox_env_client.sh` `swe_env_watch`, `sandbox/env_job/sandbox_env_ctl.py` `cmd_watch`, its `--lost-file` from `jobs/run_sandboxed_inner.sh`) |
+| `PREEMPT_SENTINEL` | `$SYNC_DIR/preempt` (D16) | `lib/preempt.sh` (sourced by `jc_preempt_arm`); `scripts/lib/common.sh` `run_dirs` / `arm_preempt_trap`, `scripts/run_local.sh` (`--preempt-sentinel`) |
+| `WANDB_API_KEY HF_TOKEN` | from `PROJECT_SECRETS="wandb_key:WANDB_API_KEY hf_token:HF_TOKEN"` via `jc_secret` under `set +x`; unset when `WANDB_ENABLE=0` | `lib/job_common.sh` `jc_secrets_load` / `jc_secret`; `scripts/run_local.sh` (`WANDB_ENABLE`), the driver's dashboard client and the hub libraries |
+| `NEMO_GYM_URL` (opt) | preset => external agent server(s), entry starts no gym | `jobs/run_sandboxed_inner.sh` (the sandbox jobs' agents), else the launch line; `scripts/run_local.sh`, `scripts/lib/gym_ladder.sh` `recipe_vars` (tmax requires it), `miles_agent/gym_bridge.py` `agent_urls` |
+| `TEACHER_URL` (opt), `RETRIEVER_URL` (opt) | `TEACHER_URL`: an already serving teacher (the launch line; no node of the run serves one then). `RETRIEVER_URL`: rank 0's tailnet bridge exports `<NAME>_URL=http://127.0.0.1:<port>` per `PROJECT_TAILNET_TARGETS` entry (`retriever:6100`) when the adapter's `PROJECT_TAILNET_WHEN` hook asks (`RECIPE=search_r1`; `TAILNET_BRIDGES=auto`, the default) or `TAILNET_BRIDGES=1` forces them (`0` skips them); `TAILNET_BRIDGES_SKIPPED` otherwise | `jobs/run_inner.sh` `tailnet_bridges` / `tailnet_wanted`, `projects/miles-agent/hooks.sh` `project_tailnet_when`; `scripts/run_local.sh`, `scripts/teacher_node.sh` `teacher_gate`, `scripts/lib/gym_ladder.sh` `recipe_vars` / `pre_ray_search_r1` |
+| `GYM_VENV_ROOT` (opt) | the mount root of the adapter's `PROJECT_STAGE_TARS` (`/opt` for this project, D6); unset => `uv run` online path | `lib/job_common.sh` `jc_project` (`jc_stage_node` unpacks the tar, `jc_mounts` binds it); `scripts/lib/gym_ladder.sh` `venv_probe_gate` / `gym_start_and_wait`, `scripts/build_gym_venvs.sh <root>` |
+| `ENTRY` (opt, submitter) | overrides `PROJECT_ENTRY` (`--env ENTRY=scripts/r2s_teacher_ft.sh`) | `jobs/run_inner.sh`, `jobs/run_sandboxed_inner.sh` (`exec bash $PROJECT_CODE_MOUNT/$ENTRY`); not read by the entries |
+| `SESSION_SERVER_EXTERNAL_HOST` (opt) | the training node's address the sandboxed agents dial back to: its cluster address, `127.0.0.1` through a tailnet bridge (S4) | `jobs/run_sandboxed_inner.sh` (rank 0); `scripts/lib/gym_ladder.sh` `recipe_vars` (tmax: `--session-server-external-host`), `miles_agent/launcher.py` (that flag) |
+| `SANDBOX_TRANSPORT` (opt) | `cluster` (default) or `tailnet`: the Contract E transport the sandbox-env job was reached by (S4) | `jobs/run_sandboxed.sbatch` (from the launch line; it sources `sandbox/env_job/sandbox_env_client.sh` and runs its Contract E functions, `swe_env_claim` / `swe_env_heartbeat` / `swe_env_wait` / `swe_env_watch`, under `cluster` only; `swe_env_names` under both), `sandbox/env_job/submit.sh` (the `cluster` launcher); read by `jobs/run_sandboxed_inner.sh`, not by the entries |
 
 Not in A on purpose: the wrapper's own roots and mount points, the QOS / partition / account (the wrapper's
 profile), in-container paths (the adapter's mounts). `NCCL_*` is a family the wrapper's hardware profile sets,
@@ -82,16 +83,18 @@ The rest of `scripts/` is for people and for the entries themselves: `start_gym.
 
 ## C. preemption / time limit
 
-Wrapper `#SBATCH --signal=B:USR1@$PREEMPT_LEAD_S` (600) -> `touch $PREEMPT_SENTINEL`, kill watchdog, wait
-(`preempt.sh:26-69`) -> entry passed `--preempt-sentinel`, refuses to start if it pre-exists
-(`miles_run_inner.sh:563-567`), every rank traps TERM/USR1 -> touch (`:22-31`) -> driver
-(`patches/miles/miles-preempt-save.patch`) finishes the step, saves, writes `<sentinel>.done={"rollout_id":N}` ->
-entry `RUN_INNER_PREEMPT_STOP rc= durable=` (`:590`) -> wrapper `PREEMPT_REQUEUE=auto|always|never`:
-`scontrol requeue` on `PreemptTime` else exit 75 `JOB_STOPPED_TO_RESUME_<job> durable=` (`preempt.sh:72-105`,
-f7c57e8). Student: `touch results/<tag>/stop`, rerun the tag to resume. The trap lives in the ENTRY (a trap in
-`run_inner.sh` dies at `exec`, S3). A step that failed without a signal and without a save is a crash, not a
-preemption: the wrapper prints `FATAL: the main step failed` and exits with the step's code (f7c57e8;
-`durable=none` with a non-zero step rc is the tell).
+Wrapper `#SBATCH --signal=B:USR1@600` (the lead the profile's `PREEMPT_LEAD_S` records) -> `touch $PREEMPT_SENTINEL`,
+kill watchdog, wait (`lib/preempt.sh` `preempt_on_signal`, `preempt_run_step`) -> entry passed `--preempt-sentinel`,
+refuses to start if it pre-exists (`scripts/run_local.sh`), every rank traps TERM/USR1 -> touch
+(`scripts/lib/common.sh` `arm_preempt_trap`) -> driver (`patches/miles/miles-preempt-save.patch`) finishes the step,
+saves, writes `<sentinel>.done={"rollout_id":N}` -> entry `RUN_INNER_PREEMPT_STOP rc= durable=`
+(`scripts/run_local.sh`) -> wrapper `PREEMPT_REQUEUE=auto|always|never`: `scontrol requeue` on `PreemptTime` else exit
+75 `JOB_STOPPED_TO_RESUME_<job> durable=` (`lib/preempt.sh` `preempt_finish`). Student:
+`touch results/<tag>/stop` (the driver saves first); remove it, then rerun the same tag to resume. The trap lives in the ENTRY (a trap in `jobs/run_inner.sh` dies
+at `exec`, S3). A step that failed with the sentinel raised but no signal to the job and no save (the step's
+`--kill-on-bad-exit` TERMed the other tasks and their traps raised it) is a crash, not a preemption, unless
+`PREEMPT_REQUEUE=always` or the job carries a `PreemptTime` (`auto`): the wrapper prints `FATAL: the main step failed (rc=N) with no signal to this job and no save`
+in place of `PREEMPT_STOP` and exits with the step's code (`lib/preempt.sh` `preempt_finish`).
 
 ## D. markers
 
@@ -99,10 +102,10 @@ Grammar: one line, `UPPER_SNAKE[_<name>] key=value ...`; `FATAL: <text>` precede
 never changes an exit code; a PASS marker is the step's last line and is printed only after rc 0; no marker
 contains a pipe (the launcher's queue parsing splits on it); names are greppable without alternation (a log grep may be BRE).
 
-| emitter | markers | today |
+| emitter | markers | source |
 |---|---|---|
-| wrapper (job) | `JOB_PASS_<PROJECT_JOB_NAME>_<RUN_TAG>`, `JOB_REQUEUE_<name>`, `JOB_STOPPED_TO_RESUME_<name> durable=`, `PREEMPT_SIGNAL`, `PREEMPT_STOP step_rc= durable=`, `STALE_SWEEP <node> ...`, `NODE_LOCAL_REMOVED <dir> in <s> s`, `IDLE_WATCHDOG_CANCEL job=`, `ENDPOINT_UP` / `ENDPOINT_WITHDRAWN`, `SANDBOX_ENV_UP` / `STOPPING` / `DRAIN` / `DONE` / `CLIENTS` / `REACH` (ex `SWE_ENV_*`), `STAGE_SHA_OK`, `JC_CLUSTER <name>`, `THREAD_BUDGET pids_max=`, `PIDS_HIGH current=` | `miles_run.sbatch:165`; `preempt.sh:18,96,103`; `idle_watchdog.sh:57`; `model_serve.sbatch:110`; `swe_env_inner.sh:38-41,214-229` |
-| entry (project) | `RUN_INNER_PASS`, `RUN_INNER_PREEMPT_STOP`, `RAY_WORKER_JOINED` / `RAY_WORKER_DONE node_rank=`, `GYM_UP agent=`, `WEBSHOP_ENGINE_UP`, `SCIW_RUNTIME`, `TEACHER_UP` / `TEACHER_GATE_OK` / `TEACHER_FAILED` / `TEACHER_ENDED`, `SERVE_PARSER` / `SERVE_PREFLIGHT` / `SERVE_UP`, `HARBOR_TRIAL_SERVER_UP url=`, `HARBOR_SUMMARY` / `HARBOR_AGENT_STATS` / `HARBOR_EXCEPTION` / `HARBOR_NOT_PASSED` / `HARBOR_RESULTS`, `R2S_*_PASS`, `FT_PASS` / `FT_FAIL`, `CONTRACT_TESTS_OK` | `miles_run_inner.sh:594,590,61,70,542`; PORT `model_serve_inner.sh:31,84`; `harbor_env.sh:221`; `harbor_run_inner.sh:145-157`; `job_env_smoke.sbatch:100` |
+| wrapper (job) | `JOB_PASS_<PROJECT_JOB_NAME>_<RUN_TAG>`, `JOB_REQUEUE_<name>`, `JOB_STOPPED_TO_RESUME_<name> durable=`, `PREEMPT_SIGNAL`, `PREEMPT_STOP step_rc= durable=`, `STALE_SWEEP <node> ...`, `NODE_LOCAL_REMOVED <dir> in <s> s`, `IDLE_WATCHDOG_CANCEL job=`, `ENDPOINT_UP` / `ENDPOINT_WITHDRAWN`, `SANDBOX_ENV_UP` / `STOPPING` / `DRAIN` / `DONE` / `CLIENTS` / `REACH` (ex `SWE_ENV_*`), `HARNESS_REACH_OK sandbox= agents=`, `STAGE_SHA_OK`, `JC_CLUSTER <name>`, `THREAD_BUDGET pids_max=`, `PIDS_HIGH current=`, `TAILNET_BRIDGE_UP name= listen=` / `TAILNET_BRIDGES_SKIPPED targets= when= override=`, `CONTRACT_A version= ...` | `jobs/run.sbatch`, `jobs/run_sandboxed.sbatch` (`JOB_PASS_*`), the single-step jobs' EXIT traps such as `jobs/convert.sbatch` (`NODE_LOCAL_REMOVED`; `jobs/run.sbatch` `job_cleanup` removes it without a marker); `lib/preempt.sh` `preempt_on_signal` / `preempt_finish`; `lib/stale_sweep.sh`; `jobs/serve.sbatch`, `jobs/serve_inner.sh`; `lib/idle_watchdog.sh`; `sandbox/env_job/sandbox_env_inner.sh`; `jobs/run_sandboxed_inner.sh`; `lib/job_common.sh` `jc_stage_gate` / `jc_prologue`; `lib/gpu_env.sh` `jc_gpu_env`; `lib/pids_sampler.sh`; `jobs/run_inner.sh` `tailnet_bridges` (`TAILNET_BRIDGE_UP`) and its rank-0 block after `tailnet_wanted` (`TAILNET_BRIDGES_SKIPPED`); `jobs/run_inner.sh`, `jobs/run_sandboxed_inner.sh` (`CONTRACT_A`, the line before the `exec`) |
+| entry (project) | `RUN_INNER_PASS`, `RUN_INNER_PREEMPT_STOP`, `RAY_WORKER_JOINED` / `RAY_WORKER_DONE node_rank=`, `GYM_UP agent=`, `WEBSHOP_ENGINE_UP`, `SCIW_RUNTIME`, `TEACHER_UP` / `TEACHER_GATE_OK` / `TEACHER_ENDED`, `SERVE_PARSER` / `SERVE_PREFLIGHT` / `SERVE_UP`, `HARBOR_TRIAL_SERVER_UP url=`, `HARBOR_SUMMARY` / `HARBOR_AGENT_STATS` / `HARBOR_EXCEPTION` / `HARBOR_NOT_PASSED` / `HARBOR_RESULTS`, `R2S_*_PASS`, `FT_PASS` / `FT_FAIL`, `CONTRACT_TESTS_OK` | `scripts/run_local.sh`; `scripts/lib/ray.sh` `ray_worker_join`; `scripts/lib/gym_ladder.sh` `gym_start_and_wait` / `pre_gym_webshop` / `pre_gym_scienceworld`; `scripts/teacher_node.sh` `teacher_node_main` / `teacher_gate`; `scripts/serve_model.sh`; `scripts/harbor_trial_server.sh`; `scripts/harbor_run.sh`; `scripts/r2s_pipeline.sh`, `scripts/r2s_teacher_ft.sh`, `miles_agent/r2s/teacher_ft.py`; `scripts/smoke_tests.sh` |
 
 `JOB_PASS` is never printed by an entry: only the wrapper knows the whole job passed. Chain rule: a link's
 `afterany` successor resumes on `JOB_STOPPED_TO_RESUME_*`, treats `JOB_PASS_*` as done and a cancelled job as
