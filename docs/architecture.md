@@ -55,7 +55,8 @@ the episode runs:
   session server; reward is the verifier's. (`recipes/tmax`; `scripts/harbor_trial_server.sh`,
   `scripts/harbor_run.sh`.) With Harbor's docker environment the pack must be visible inside every trial container:
   build it, then mount it into the containers yourself — this repository has no mount mechanism for it yet
-  (`docs/data.md`).
+  (`docs/data.md`). `miles_harbor.opensandbox_env` runs the sandboxes on an OpenSandbox server instead
+  (`docs/local_setup.md`).
 
 ## Tool-call markup and model families
 

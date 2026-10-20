@@ -6,8 +6,9 @@ requires-python = ">= 3.13.14"
 dependencies = [
     # Harbor runs the trials unmodified (agent, verifier, timeouts); this package adds the trial server and the
     # harnesses; the trial's environment is Harbor's docker environment or the backend HARBOR_ENVIRONMENT_IMPORT_PATH
-    # names. Pinned: that backend implements this release's BaseEnvironment contract.
-    "harbor==0.24.0",
+    # names (with the opensandbox extra: miles_harbor.opensandbox_env's). Pinned: that backend implements this release's
+    # BaseEnvironment contract.
+    "harbor[opensandbox]==0.24.0",
     "nemo-gym[sandbox]",
 ]
 

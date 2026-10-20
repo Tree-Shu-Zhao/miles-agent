@@ -42,7 +42,8 @@
 #   HARBOR_PACK_ROOT        where the harness packs are (read by miles_harbor.harnesses in Harbor's process); default
 #                           $HOME/.cache/miles-harness of the account's HOME, resolved and exported here before Harbor
 #                           gets <work dir>/home as its HOME
-#   RUN_TAG                 the job's name (default: the out dir's name)
+#   RUN_TAG                 the job's name (default: the out dir's name), Harbor's RUN_TAG too (a sandbox backend's
+#                           label of the job's sandboxes: miles_harbor.opensandbox_env's)
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
@@ -197,6 +198,7 @@ fi
 export HARBOR_PACK_ROOT
 if is_dry_run; then
   echo "DRY_RUN env: HOME=$WORK/home"
+  echo "DRY_RUN env: RUN_TAG=$TAG"
   echo "DRY_RUN env: HARBOR_PACK_ROOT=$HARBOR_PACK_ROOT"
   dry_run_print harbor_run "$HARBOR_BIN" run -c "$JOB" -y
   exit 0
@@ -207,7 +209,7 @@ HARBOR_PID=""
 trap 'echo "HARBOR_RUN_SIGNAL $(date "+%F %T")"; [ -z "$HARBOR_PID" ] || kill -INT "$HARBOR_PID" 2>/dev/null' USR1 TERM
 set +e
 # Harbor's caches (task downloads, its config) under the work dir, not in the account's home
-( export HOME=$WORK/home; cd "$WORK" && exec "$HARBOR_BIN" run -c "$JOB" -y ) &
+( export HOME=$WORK/home RUN_TAG=$TAG; cd "$WORK" && exec "$HARBOR_BIN" run -c "$JOB" -y ) &
 HARBOR_PID=$!
 wait "$HARBOR_PID"
 RC=$?

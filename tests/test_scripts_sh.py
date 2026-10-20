@@ -821,7 +821,8 @@ def test_local_env_example_documents_every_public_knob(tmp_path):
         "WEBSHOP_MD5_TABLE", "WEBSHOP_ENGINE_BASE_URL", "BUILD_DIR", "GYM_TAR", "HARBOR_DATASET", "HARBOR_PROVIDER",
         "HARBOR_ENVIRONMENT_KWARGS", "HARBOR_HARNESS", "HARBOR_AGENT_KWARGS", "HARBOR_MAX_CONCURRENT",
         "HARBOR_AGENT_NETWORK", "HARBOR_REWARD_REQUIRES_SUBMIT", "HARBOR_RECORDS", "HARBOR_WORK_DIR", "HARBOR_PYTHON",
-        "HARBOR_BIN", "TRIAL_SERVER_VENV", "TRIAL_SERVER_MODULE",
+        "HARBOR_BIN", "TRIAL_SERVER_VENV", "TRIAL_SERVER_MODULE", "OPENSANDBOX_ENDPOINT", "OPENSANDBOX_KEY",
+        "OPENSANDBOX_CA_FILE", "OPENSANDBOX_PROXY",
     }
     assert expected <= documented, sorted(expected - documented)
     for knob in ("RECIPE", "TOPOLOGY", "RUN_TAG", "RUN_SCRIPT", "PROMPT", "EXTRA_ARGS", "MODE"):
@@ -3790,7 +3791,7 @@ def test_harbor_run_dry_run_builds_the_job_config(tmp_path):
         "verifier": {"disable": True},
     }
     assert _dry(out, "harbor_run") == ["harbor", "run", "-c", f"{out_dir}/work/job.yaml", "-y"]
-    assert _dry_env(out)["HOME"] == f"{out_dir}/work/home"
+    assert _dry_env(out)["HOME"] == f"{out_dir}/work/home" and _dry_env(out)["RUN_TAG"] == "eval1"
     assert _dry_env(out)["HARBOR_PACK_ROOT"] == f"{tmp_path}/.cache/miles-harness"  # the account's HOME, resolved before the override
     assert not out_dir.exists() and _calls(env, "harbor") == [] and "WARN" not in out
     # the docker default: no environment key (a --provider is a WARN only); the registry spelling; Harbor's own oracle;
@@ -3804,6 +3805,7 @@ def test_harbor_run_dry_run_builds_the_job_config(tmp_path):
     assert job["datasets"] == [{"name": "swebench-verified", "version": "1.0", "download_dir": "/w/tasks"}]
     assert (job["job_name"], job["jobs_dir"], job["n_attempts"], job["n_concurrent_trials"]) == ("sv", "/w/jobs", 1, 32)
     assert _dry(out, "harbor_run") == ["/opt/hb/bin/harbor", "run", "-c", "/w/job.yaml", "-y"] and _dry_env(out)["HOME"] == "/w/home"
+    assert _dry_env(out)["RUN_TAG"] == "sv"
     rc, out = _run_script(HARBOR_RUN, "--dry-run", "--out", str(out_dir),
                           env=_env(tmp_path, HARBOR_DATASET="swebench-verified@1.0", HARBOR_PACK_ROOT="/packs", **common))
     assert rc == 0 and _dry_env(out)["HARBOR_PACK_ROOT"] == "/packs", out  # an explicit root as it is

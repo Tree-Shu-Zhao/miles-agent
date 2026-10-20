@@ -216,8 +216,9 @@ if [ -z "${HARBOR_PACK_ROOT:-}" ]; then
   HARBOR_PACK_ROOT=$HOME/.cache/miles-harness
 fi
 export HARBOR_PACK_ROOT
-# Harbor's caches (task downloads, its config) under the work dir, not in the account's home
-( export HOME=$WORK/home; cd "$WORK" && exec "$TS_PYTHON" -m "$TS_MODULE" --config "$CONFIG" --host "$HOST" --port "$PORT" > "$LOG" 2>&1 ) &
+# Harbor's caches (task downloads, its config) under the work dir, not in the account's home; RUN_TAG (default harbor)
+# for a sandbox backend's label of the server's sandboxes
+( export HOME=$WORK/home RUN_TAG=$TAG; cd "$WORK" && exec "$TS_PYTHON" -m "$TS_MODULE" --config "$CONFIG" --host "$HOST" --port "$PORT" > "$LOG" 2>&1 ) &
 TS_PID=$!
 trap 'stop_server; cleanup' EXIT
 trap 'stop_server; exit 0' TERM INT

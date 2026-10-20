@@ -65,6 +65,28 @@ them read-only at the same path), and keep it exported for the scripts:
 `scripts/harbor_trial_server.sh` exports that same default itself, resolved from the account's `HOME` before it
 gives the server a `HOME` under its work dir.
 
+## Sandboxes on an OpenSandbox server
+
+The Harbor recipes can run their sandboxes on an [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox)
+server instead of the local docker daemon: the trial server and `harbor run` stay where they are, each trial's
+sandbox is created on the server, and every command reaches it through the server's proxy, over the endpoint's
+scheme (https).
+
+    export HARBOR_ENVIRONMENT_IMPORT_PATH=miles_harbor.opensandbox_env:OpenSandboxEnvironment
+    export OPENSANDBOX_ENDPOINT=https://<server> OPENSANDBOX_KEY=<key>   # from your shell, never a committed file
+    export OPENSANDBOX_CA_FILE=<server.pem>        # a self-signed server: its certificate
+    python -m miles_harbor.opensandbox_env check    # OPENSANDBOX_CHECK_OK: a sandbox created, a command run, killed
+    HARBOR_DATASET=terminal-bench@2.0 HARBOR_N_TASKS=8 scripts/harbor_run.sh --out results/tb2-oracle
+
+The server and its key are read from the environment only (the scripts print the backend's kwargs with the job's
+config); `OPENSANDBOX_PROXY` names a proxy to reach the server through. What the tasks and the harnesses need: a
+prebuilt image per task (`environment.docker_image`: no Dockerfile build, no compose), checked as the trial server
+starts; one network for the whole trial (the agent keeps the task's: `HARBOR_AGENT_NETWORK=endpoint` is not
+enforced, which the trial server says as it starts); a harness that runs beside the sandbox (vanillux) needs
+nothing more, one inside it must reach its model endpoint from the server's network. Each sandbox carries the run's
+`RUN_TAG` as a label and expires on the server after 6 hours; `python -m miles_harbor.opensandbox_env sweep --run
+<RUN_TAG>` kills a run's leftovers at once.
+
 ## Ports: one run per machine
 
 A run and its services use fixed ports and hand each other `http://127.0.0.1:<port>` URLs, so the scripts assume
