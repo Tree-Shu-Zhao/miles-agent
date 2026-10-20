@@ -3,9 +3,9 @@
 # machine's GPUs (miles_agent.r2s.teacher_ft: FSDP, the campaign's optimizer and schedule, the held-out CE gate),
 # promoted to its final name only when the gate passed. No scheduler call: a scheduler wrapper (docs/cluster.md)
 # may run it inside the miles container on a cluster node, a plain machine runs it directly.
-#   TAG         the output name under $MILES_AGENT_MODELS, by convention r2s-<env>-<student>-teacher
-#               (e.g. r2s-alfworld-qwen3.5-4b-teacher, the student arm's TEACHER_MODEL; launcher.py MODEL_FAMILIES
-#               resolves its family by the longest key in the name)
+#   TAG         the output name under $MILES_AGENT_MODELS, by convention r2s-<env>-<teacher>-teacher-for-<student>
+#               (e.g. r2s-alfworld-qwen3.5-9b-teacher-for-qwen3.5-4b, the student arm's TEACHER_MODEL;
+#               launcher.py MODEL_FAMILIES resolves its family by the longest key in the name)
 #   LABELS      stage D's labels.jsonl (LABEL_DONE; objective "suffix": teacher_ft refuses any other label file)
 #   BASE_MODEL  the base teacher under the same models dir (default Qwen3.5-9B)
 #   LR EPOCHS GRAD_ACCUM  the campaign's FT knobs (2e-6, 1, 8); FT_EXTRA more teacher_ft flags, verbatim
@@ -21,7 +21,7 @@
 set -euxo pipefail
 DRY_RUN=${DRY_RUN:-}
 case "${1:-}" in --dry-run|--dry-run=1|--dry-run=argv) DRY_RUN=1 ;; "") ;; *) echo "FATAL: unknown argument $1 (the knobs are environment variables; the one flag is --dry-run)"; exit 1 ;; esac
-: "${TAG:?TAG=<output name under the models dir: r2s-<env>-<student>-teacher>}"
+: "${TAG:?TAG=<output name under the models dir: r2s-<env>-<teacher>-teacher-for-<student>>}"
 : "${LABELS:?LABELS=<stage D labels.jsonl>}"
 BASE_MODEL=${BASE_MODEL:-Qwen3.5-9B}
 SRC=${SRC_MOUNT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}

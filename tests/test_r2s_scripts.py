@@ -726,7 +726,7 @@ def test_r2s_teacher_ft_sh_anchors():
     code = "\n".join(line for line in sh.splitlines() if not line.lstrip().startswith("#"))
     assert not re.search(r"(^|[\s;&|(`])rm\s", code)
     assert not re.search(r"\b(sr" "un|sb" "atch|scon" r"trol|squeue|scancel)\b", code)
-    assert "r2s-<env>-<student>-teacher" in sh.split("set -e")[0]
+    assert "r2s-<env>-<teacher>-teacher-for-<student>" in sh.split("set -e")[0]
     assert "MODELS=$MILES_AGENT_MODELS" in sh and "OUT_DIR=$MODELS/$TAG" in sh and "SRC=${SRC_MOUNT:-" in sh
     assert 'SCRATCH=${LOCAL:-${NODE_LOCAL:-/tmp}}' in sh and '. "$SRC/scripts/lib/common.sh"' in sh
     assert 'DRY_RUN=${DRY_RUN:-}' in sh
@@ -743,7 +743,7 @@ def _ft_case(tmp_path, name, **settings):
     (root / "labels.jsonl").write_text('{"state_id": "s", "objective": "suffix", "ids": [1], "positions": []}\n')
     env.update(
         {
-            "TAG": "r2s-alfworld-qwen3.5-4b-teacher",
+            "TAG": "r2s-alfworld-qwen3.5-9b-teacher-for-qwen3.5-4b",
             "LABELS": str(root / "labels.jsonl"),
             "LOCAL": str(root / "local"),
             "SRC_MOUNT": str(REPO),
@@ -765,7 +765,7 @@ def test_r2s_teacher_ft_sh_promotes_on_pass_only(tmp_path):
     the first free n when that name is taken (never nested inside it); --skip-gate's unimproved export (torchrun
     exits 0, the report says passed false) is promoted with gate=skipped on the marker; LR / EPOCHS / GRAD_ACCUM /
     FT_EXTRA and MILES_AGENT_MODELS reach the command line; no GPU or no labels file is FATAL."""
-    tag = "r2s-alfworld-qwen3.5-4b-teacher"
+    tag = "r2s-alfworld-qwen3.5-9b-teacher-for-qwen3.5-4b"
     root, result, events = _ft_case(tmp_path, "pass")
     assert result.returncode == 0, result.stdout + result.stderr
     models = root / "models"
@@ -871,7 +871,7 @@ def test_r2s_teacher_ft_sh_dry_run_under_the_wrapper_names(tmp_path):
     for key in list(env):
         if key == "LOCAL" or key.startswith("MILES_AGENT_"):
             del env[key]
-    tag = "r2s-alfworld-qwen3.5-4b-teacher"
+    tag = "r2s-alfworld-qwen3.5-9b-teacher-for-qwen3.5-4b"
     env.update(MODELS_DIR=str(root / "models"), NODE_LOCAL=str(root / "local"), JOB_ID="123", LOCAL_ENV="/dev/null",
                SRC_MOUNT=str(REPO), TAG=tag, LABELS=str(root / "labels.jsonl"), BASE_MODEL="Qwen3.5-9B")
     result = subprocess.run(["bash", str(FT_SH), "--dry-run"], env=env, capture_output=True, text=True, timeout=60)

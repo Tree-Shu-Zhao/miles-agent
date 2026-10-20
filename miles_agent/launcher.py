@@ -194,8 +194,8 @@ MODEL_FAMILIES = {
 
 def _listed_family(model_name: str) -> ModelFamily | None:
     """The row of the longest key prefixing the name ("Qwen3-30B-A3B-Instruct-2507" over "Qwen3-"); else, for a
-    fine-tune's directory such as "r2s-alfworld-qwen3.5-4b-teacher", the row of the unique longest key found
-    anywhere in the name, case-insensitively; None when no key matches."""
+    fine-tune's directory such as "r2s-alfworld-qwen3.5-9b-teacher-for-qwen3.5-4b", the row of the unique longest key
+    found anywhere in the name, case-insensitively; None when no key matches."""
     prefixes = [key for key in MODEL_FAMILIES if model_name.startswith(key)]
     if prefixes:
         return MODEL_FAMILIES[max(prefixes, key=len)]

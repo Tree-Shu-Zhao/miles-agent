@@ -90,7 +90,6 @@ IDENTITY_LITERAL_PARTS = [
     "/lus" "tre/fsw",
     "/scratch/" "fsw",
     "smz" "5505",
-    "Treezz" "Z",
     r"100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]+\.[0-9]+",
     "@nvi" "dia\\.com",
     r"\bNVIDIA\b(?!-NeMo)",

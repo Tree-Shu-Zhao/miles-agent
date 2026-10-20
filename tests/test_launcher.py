@@ -837,12 +837,13 @@ def test_qwen_moe_checkpoints_by_their_name(stubs):
 
 def test_fine_tuned_teacher_dir_resolves_its_family(stubs):
     """The row of the longest key prefixing the name; else, for a fine-tuned checkpoint's dir (the paper's
-    teachers, r2s-<env>-<student>-teacher), the row of the unique longest key found anywhere in it, whatever
+    teachers, r2s-<env>-<teacher>-teacher-for-<student>), the row of the unique longest key found anywhere in it, whatever
     the case; two keys of one length raise."""
     launcher = stubs.launcher
     families = launcher.MODEL_FAMILIES
-    assert launcher.model_family("r2s-alfworld-qwen3.5-4b-teacher") is families["Qwen3.5-"]
-    assert launcher.model_family("r2s-webshop-qwen3-8b-teacher") is families["Qwen3-"]
+    assert launcher.model_family("r2s-alfworld-qwen3.5-9b-teacher-for-qwen3.5-4b") is families["Qwen3.5-"]
+    # the Qwen3 pairs' teacher: "Qwen3-" is the one key found in the name (the Instruct-2507 row needs its full name)
+    assert launcher.model_family("r2s-webshop-qwen3-30b-a3b-teacher-for-qwen3-8b") is families["Qwen3-"]
     teacher = "r2s-scienceworld-Qwen3-30B-A3B-Instruct-2507-teacher"
     assert launcher.model_family(teacher) is families["Qwen3-30B-A3B-Instruct-2507"]
     # the longest prefix: the 2507 row over Qwen3-, which keeps every other Qwen3 checkpoint
@@ -855,10 +856,10 @@ def test_fine_tuned_teacher_dir_resolves_its_family(stubs):
         launcher.model_family("merge-of-qwen3.5-4b-and-qwen3.6-27b")
     # the fine-tune's family flows into the args; its megatron type, were it trained, cannot be derived
     alfworld = stubs.runs["alfworld"]
-    args = alfworld.ScriptArgs(model_name="r2s-alfworld-qwen3.5-4b-teacher", megatron_model_type="qwen3.5-4B")
+    args = alfworld.ScriptArgs(model_name="r2s-alfworld-qwen3.5-9b-teacher-for-qwen3.5-4b", megatron_model_type="qwen3.5-4B")
     assert (args.tito_model, args.chat_template_kwargs, args.moe) == ("qwen35", '{"enable_thinking": false}', False)
     with pytest.raises(ValueError, match="--megatron-model-type"):
-        alfworld.ScriptArgs(model_name="r2s-alfworld-qwen3.5-4b-teacher")
+        alfworld.ScriptArgs(model_name="r2s-alfworld-qwen3.5-9b-teacher-for-qwen3.5-4b")
 
 
 def test_qwen3_30b_a3b_family_is_moe(stubs):

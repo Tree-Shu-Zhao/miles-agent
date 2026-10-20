@@ -8,8 +8,10 @@ the reproduction ledger (§9). Paths are relative to the repo root; `$MILES_AGEN
 `docs/cluster.md`).
 
 Reproduction: the release tag `r2s` pins the code the paper's main-table cells were run with — `git checkout r2s` —
-because later commits on `main` may delete or refactor any of this. The trained teachers and students are not
-public yet.
+because later commits on `main` may delete or refactor any of this. The trained teachers and students are on the
+Hugging Face Hub (24 repositories under https://huggingface.co/TreezzZ): each student as
+`TreezzZ/r2s-<env>-<student>-student` and the repaired teacher that distilled it as
+`TreezzZ/r2s-<env>-<teacher>-teacher-for-<student>`, its base model in the name.
 
 ## 1. What the method does
 
@@ -82,8 +84,9 @@ one-shot rows, `prompts/<env>/r2s_oneshot.py`, rendered in the policy model's ow
 | opd_kl_coef / opd_dump | 1.0 / off | same | same |
 
 The paper's models: Qwen3.5-9B teaches Qwen3.5-2B and 4B, Qwen3-30B-A3B-Instruct-2507 teaches Qwen3-4B and 8B.
-A repaired teacher's directory is named `r2s-<env>-<student>-teacher` (e.g. `r2s-alfworld-qwen3.5-4b-teacher`)
-and resolves its model family by the longest `MODEL_FAMILIES` key in its name. The paper's vanilla and anchor
+A repaired teacher's directory is named `r2s-<env>-<teacher>-teacher-for-<student>` (e.g.
+`r2s-alfworld-qwen3.5-9b-teacher-for-qwen3.5-4b`, the Hub names of the release) and resolves its model family by
+the longest `MODEL_FAMILIES` key in its name. The paper's vanilla and anchor
 cohort ran seed 43 on ALFWorld and ScienceWorld (42 on WebShop) under `async_2n_teacher`; the presets default
 to seed 42 and `async_4n_teacher`, so a vanilla twin passes `EXTRA_ARGS="--seed 43"`.
 
@@ -394,8 +397,8 @@ whatever the worker's code, so the verdict is the report: `scripts/r2s_teacher_f
 `<models>/<TAG>.tmp`, moves it to `<models>/<TAG>` on `R2S_FT_PASS`, and on a report saying `passed` false
 prints `R2S_FT_FAIL` and exits 2 with the `.tmp` holding only the report (nothing promoted); any other
 nonzero exit is `FATAL: torchrun exited <rc> before the gate verdict`. An existing `<TAG>` is refused, an
-earlier `.tmp` is set aside as `<TAG>.failed-<job>`. The output name is `r2s-<env>-<student>-teacher`, the
-student arm's `TEACHER_MODEL`; `MODEL_FAMILIES` resolves its family by the longest key in the name.
+earlier `.tmp` is set aside as `<TAG>.failed-<job>`. The output name is `r2s-<env>-<teacher>-teacher-for-<student>`,
+the student arm's `TEACHER_MODEL`; `MODEL_FAMILIES` resolves its family by the longest key in the name.
 
 ### 4.3 WebShop
 
@@ -466,13 +469,13 @@ DUMP_GLOB="$MILES_AGENT_RESULTS/<pilot>/opd_dump/dump_*.jsonl" scripts/run_local
 ### 4.5 The FT stage (`scripts/r2s_teacher_ft.sh`)
 
 One GPU machine (~1-2 h for a 9B teacher on the campaign's labels); `torchrun --nproc-per-node <the machine's GPUs>`. Knobs: `TAG`
-(the output name, `r2s-<env>-<student>-teacher`), `LABELS` (stage D's `labels.jsonl`, `LABEL_DONE`),
+(the output name, `r2s-<env>-<teacher>-teacher-for-<student>`), `LABELS` (stage D's `labels.jsonl`, `LABEL_DONE`),
 `BASE_MODEL` (`Qwen3.5-9B`), `LR` / `EPOCHS` / `GRAD_ACCUM` (2e-6 / 1 / 8), `FT_EXTRA` (more `teacher_ft` flags,
 verbatim). Exit 2 = the gate refused the teacher (`R2S_FT_FAIL`, the report in `<TAG>.tmp`); exit 0 =
 `R2S_FT_PASS out=<MILES_AGENT_MODELS>/<TAG>`.
 
 ```bash
-TAG=r2s-alfworld-qwen3.5-4b-teacher LABELS=$MILES_AGENT_DATA/r2s/<tag>/labels.jsonl BASE_MODEL=Qwen3.5-9B \
+TAG=r2s-alfworld-qwen3.5-9b-teacher-for-qwen3.5-4b LABELS=$MILES_AGENT_DATA/r2s/<tag>/labels.jsonl BASE_MODEL=Qwen3.5-9B \
   scripts/r2s_teacher_ft.sh
 ```
 
