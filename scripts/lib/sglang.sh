@@ -1,3 +1,4 @@
+#!/bin/bash
 # Shared sglang server start / wait / stop for the jobs that serve a model next to training or a pipeline stage
 # (scripts/teacher_node.sh: the OPD teacher; the R2S pipeline stages) and for a plain
 # machine with two servers: sourced, no scheduler call. Contract with the sourcing script: `add_cleanup <fragment>`

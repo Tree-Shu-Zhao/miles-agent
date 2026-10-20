@@ -84,6 +84,7 @@ append_override() {  # <+key=value>
   GYM_EXTRA_OVERRIDES="${GYM_EXTRA_OVERRIDES:+$GYM_EXTRA_OVERRIDES }$1"
 }
 
+# shellcheck disable=SC2034  # the variables recipe_vars sets are read by the sourcing entries (scripts/run_local.sh, scripts/start_gym.sh)
 recipe_vars() {  # <recipe>
   RECIPE=${1:-${RECIPE:-}}
   [ -n "$RECIPE" ] || fatal "recipe_vars: a recipe is required (alfworld | scienceworld | webshop | search_r1 | tmax)"
@@ -592,7 +593,8 @@ gym_start_and_wait() {
   mkdir -p /tmp/gymray "$RUNS_DIR"
   # The exec makes $! the gym process itself, not a wrapper subshell: the cleanup trap's kill reaches it.
   (
-    cd "$(gym_cwd)"
+    cd "$(gym_cwd)" || exit 1
+    # shellcheck disable=SC2163  # each $kv is a KEY=VALUE line of gym_env: exporting that pair is the point
     while IFS= read -r kv; do export "$kv"; done <<EOF
 $(gym_env)
 EOF

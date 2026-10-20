@@ -57,8 +57,8 @@ jobs:
           set -e
           find scripts examples -type f \( -name '*.sh' -o -name '*.sbatch' \) -print0 | xargs -0 -n1 bash -n
       - name: shellcheck (warning level; sourced libs resolved from scripts/lib)
-        # advisory until its verdict on these scripts is known (never run on them yet); the bash -n step above is the required check
-        continue-on-error: true
+        # required: the scripts are shellcheck-clean at warning level since this change (every finding fixed or carrying a
+        # reasoned `# shellcheck disable=` directive); the bash -n step above stays the parse check
         run: |
           find scripts examples -type f \( -name '*.sh' -o -name '*.sbatch' \) -print0 \
             | xargs -0 shellcheck -S warning -x -P scripts/lib -e SC1090,SC1091

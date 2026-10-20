@@ -108,6 +108,7 @@ expand_var() {  # <text> <name> <value>
   EXPANDED="$out$text"
 }
 
+# shellcheck disable=SC2120  # [file] is the documented optional argument; the lib's own call below passes none ($LOCAL_ENV)
 load_local_env() {  # [file]
   local file=${1:-$LOCAL_ENV} line key val seen=" "
   [ -f "$file" ] || return 0
@@ -209,8 +210,7 @@ arm_preempt_trap() { trap preempt_term TERM USR1; }
 # tail of <logfile>) instead of burning the whole budget.
 wait_http_ready() {
   local url=$1 pid=$2 logfile=$3 tries=$4 sleep_s=$5 pred=${6:-:}
-  local i
-  for i in $(seq "$tries"); do
+  for _ in $(seq "$tries"); do
     if "$pred" && "$CURL" -sf -o /dev/null "$url"; then return 0; fi
     if ! kill -0 "$pid" 2>/dev/null; then
       echo "wait_http_ready: pid $pid exited before $url answered — last 100 lines of $logfile:"
@@ -235,7 +235,7 @@ port_expand() {  # "6100 7100-7131 8200" -> one port per line
 # A fixed port held by someone else on a shared machine: say who, before anything starts. Nothing is ever
 # killed here (a stale-process sweep is a job wrapper's business, with the wrapper's knowledge of ownership).
 port_precheck() {  # <ports...> [-- <urls...>]
-  local ports= skip= p u host_port listing line
+  local ports='' skip='' p u host_port listing line
   while [ $# -gt 0 ]; do
     [ "$1" != -- ] || { shift; break; }
     ports="$ports $1"
@@ -289,6 +289,7 @@ node_ip() {
 
 # ---- the defaults: environment first, then local.env, then the repo ----
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# shellcheck disable=SC2034  # read by the sourcing scripts (scripts/run_local.sh, ray_cluster.sh, start_gym.sh: . "$LIB/<lib>.sh")
 LIB=$REPO/scripts/lib
 LOCAL_ENV=${LOCAL_ENV:-$REPO/local.env}
 load_local_env

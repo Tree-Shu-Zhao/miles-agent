@@ -3489,7 +3489,7 @@ def test_build_gym_venvs_dry_run_lists_the_pinned_steps(tmp_path):
     # verify_boot's gym is the EXIT trap's to kill as well: a failure between the launch and its own kill (or a TERM)
     # leaves no gym behind
     body = _function_body((SCRIPTS / "build_gym_venvs.sh").read_text(), "verify_boot")
-    assert body.index("GYM_PID=$!") < body.index("add_cleanup 'kill $GYM_PID 2>/dev/null'") < body.index("for i in $(seq 84)")
+    assert body.index("GYM_PID=$!") < body.index("add_cleanup 'kill $GYM_PID 2>/dev/null'") < body.index("for _ in $(seq 84)")
     # the JDK in the ladder's order (scripts/lib/common.sh scienceworld_java_home): the alias beats JAVA_HOME; a
     # missing JDK is a WARN under --dry-run that names the knobs
     env3 = _env(tmp_path, **roots, JAVA_HOME="/jh", SCIW_JAVA_HOME=str(jdk))

@@ -73,6 +73,7 @@ case "$cmd" in
     ray_head "$ip" "$gpus"
     # ray_head registers `ray stop --force` for a run's exit; this head must outlive the script (run_local.sh reuses
     # it, `stop` ends it), so the registration is dropped again
+    # shellcheck disable=SC2034  # the EXIT-trap accumulator of scripts/lib/common.sh (its cleanup evals it)
     G_CLEANUP=":"
     echo "RAY_HEAD=$ip:6379"
     ;;

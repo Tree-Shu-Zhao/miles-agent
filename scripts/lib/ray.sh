@@ -27,9 +27,10 @@
 #                                   (nodes x GPUs per node, the teacher node of a *_teacher topology excluded)
 
 ray_head() {  # <ip> <gpus>
-  local ip=$1 gpus=$2 dash_ok i
+  local ip=$1 gpus=$2 dash_ok
   export MASTER_ADDR=$ip
   (
+    # shellcheck disable=SC2046  # one word per variable name: the splitting is the point
     unset $(env | grep -E '^(PMI|PMIX|MPI|OMPI|SLURM)' | cut -d= -f1)
     # All interfaces: the dashboard registers <node ip>:8265 with the GCS, which miles' worker
     # manager (an actor on any node) reads for list_nodes(); bound to loopback it registers
@@ -43,7 +44,7 @@ ray_head() {  # <ip> <gpus>
   export MILES_SCRIPT_EXTERNAL_RAY=1
   # Hard gate: our dashboard must own 8265 or job submission goes astray again.
   dash_ok=0
-  for i in $(seq 12); do
+  for _ in $(seq 12); do
     "$CURL" -sf -o /dev/null "http://127.0.0.1:8265/api/version" && { dash_ok=1; break; }
     sleep 5
   done
@@ -56,6 +57,7 @@ ray_worker_join() {  # <head_ip> <own_ip> <gpus> <node_rank>
   local head_ip=$1 own_ip=$2 gpus=$3 node_rank=$4 joined
   # scheduler env confuses ray workers; safe here — every value this
   # branch needs is already expanded
+  # shellcheck disable=SC2046  # one word per variable name: the splitting is the point
   unset $(env | grep -E '^(PMI|PMIX|MPI|OMPI|SLURM)' | cut -d= -f1)
   joined=0
   for _ in $(seq 60); do

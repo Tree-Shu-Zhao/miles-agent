@@ -1,3 +1,4 @@
+#!/bin/bash
 # The OPD campaign branches' job knobs that main does not read, refused with their replacement the moment the head
 # starts (the STUDENT_MODEL rule of the training entry: never silently ignored). Sourced; it only reads the environment.
 retired_knob() {  # <name> <replacement>

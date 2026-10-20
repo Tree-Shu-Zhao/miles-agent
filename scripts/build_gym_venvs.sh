@@ -141,7 +141,7 @@ else
   run_step uv_bootstrap_venv uv venv --python "$py_path" "$UVBOOT"
   run_step uv_bootstrap_upgrade uv pip install --python "$UVBOOT/bin/python3" -U uv
 fi
-case "$UV" in */*) export PATH=$(dirname "$UV"):$PATH ;; esac
+case "$UV" in */*) PATH=$(dirname "$UV"):$PATH; export PATH ;; esac
 run_step uv_version "$UV" --version
 run_step uv_python "$UV" python install "$PY_VERSION"
 
@@ -185,10 +185,10 @@ build_server() {  # <server>
   if [ "$s" = alfworld_env ] && [ "$ARCH" = aarch64 ]; then textworld_stub "$V"; fi
   case "$s" in
     wiki_search)
-      run_in "$dir" uv_pip "$UV" pip install -p "$V" -e "$GYM[dev]" -e . "ray[default]==$RAY_V" "openai==$OPENAI_V" ;;
+      run_in "$dir" uv_pip "$UV" pip install -p "$V" -e "${GYM}[dev]" -e . "ray[default]==$RAY_V" "openai==$OPENAI_V" ;;
     alfworld_env|webshop_env|scienceworld_env)
       # plus the shared overlay package (agent_utils.session_gym / procslots) the three servers import
-      run_in "$dir" uv_pip "$UV" pip install -p "$V" -e "$GYM[dev]" -e . -e "$REPO/gym_root/agent_utils" "ray[default]==$RAY_V" "openai==$OPENAI_V" ;;
+      run_in "$dir" uv_pip "$UV" pip install -p "$V" -e "${GYM}[dev]" -e . -e "$REPO/gym_root/agent_utils" "ray[default]==$RAY_V" "openai==$OPENAI_V" ;;
     *)
       # requirements.txt carries the editable nemo-gym[dev] line itself (its relative path resolves against the
       # requirements file's dir -> the pinned checkout), mirroring gym's editable-install branch
@@ -253,7 +253,7 @@ verify_boot() {
   # start the full server set of the wiki_search config exactly as a run will — prebuilt venvs, zero installs,
   # offline. Placeholder train/validation rows (copies of example.jsonl, moved aside by scripts/fetch_data.sh
   # search_r1) and a dummy env.yaml only stand in for the probe.
-  local data=$REPO/gym_root/resources_servers/wiki_search/data log=$BUILD_DIR/gym_boot.log ok i
+  local data=$REPO/gym_root/resources_servers/wiki_search/data log=$BUILD_DIR/gym_boot.log ok
   local gym=$ROOT/gym_main_venv/bin/gym
   [ -f "$data/example.jsonl" ] || gate "$data/example.jsonl missing (it is a committed fixture)"
   if ! is_dry_run; then
@@ -287,7 +287,7 @@ verify_boot() {
   add_cleanup 'kill $GYM_PID 2>/dev/null'
   # head server /readyz: 200 once every server it spawned is up (gym >= 0.7.0)
   ok=0
-  for i in $(seq 84); do
+  for _ in $(seq 84); do
     "$CURL" -sf -o /dev/null http://127.0.0.1:8100/readyz && { ok=1; break; }
     kill -0 "$GYM_PID" 2>/dev/null || break
     sleep 5

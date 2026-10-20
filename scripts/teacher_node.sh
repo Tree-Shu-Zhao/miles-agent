@@ -1,3 +1,4 @@
+#!/bin/bash
 # The OPD teacher of a *_teacher topology: the allocation's LAST node serves it with sglang, outside ray, for
 # miles_agent.opd.teacher_scoring (the student's whole token stream goes in as input_ids, its sampled log-probs come
 # out: scoring only, so no chat template, no parser, no cuda graphs). Sourced by the training entry after

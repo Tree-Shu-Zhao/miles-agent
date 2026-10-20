@@ -1,3 +1,4 @@
+#!/bin/bash
 # The R2S repair pipeline on one GPU machine: stages A -> B [-> J] -> C -> D of miles_agent.r2s over the pilot dump
 # of an opd arm (docs/r2s.md section 4), with the servers the stages dial started here over scripts/lib/sglang.sh.
 # The base teacher (:13141, GPUs 0..TEACHER_DP-1; the family's fixed template with thinking defaulted off, its
