@@ -29,7 +29,7 @@ IDENTITY = [  # (pattern, why); no allowlist
     ("nvl" "72", "a node host name"),
     # the public identity's own e-mail; every other "shu" "zhao"@ is a site literal
     ("shu" "zhao" r"(?!\.cs@gmail\.com)", "the owner's username: write $USER"),
-    ("Treezz" "Z", "a personal hub namespace"),
+    # the owner's Hub namespace left this list on 2026-10-20: the R2S checkpoints are published under it
     ("smz" "5505", "a personal account id"),
     (r"forge\.core" "weave", "an internal host"),
     (r"\.secre" "ts/", "the private secrets layout"),

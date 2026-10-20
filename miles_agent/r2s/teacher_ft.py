@@ -21,10 +21,11 @@ served verbatim (patch_saved_config) and the processor sidecars are copied, so s
 base model.
 
     torchrun --standalone --nproc-per-node 4 -m miles_agent.r2s.teacher_ft \\
-        --data labels.jsonl --model-path $MILES_AGENT_MODELS/Qwen3.5-9B --out-dir $MILES_AGENT_MODELS/r2s-alfworld-qwen3.5-4b-teacher
+        --data labels.jsonl --model-path $MILES_AGENT_MODELS/Qwen3.5-9B --out-dir $MILES_AGENT_MODELS/r2s-alfworld-qwen3.5-9b-teacher-for-qwen3.5-4b
 
 scripts/r2s_teacher_ft.sh runs it into <out>.tmp and promotes the dir on FT_PASS (a scheduler wrapper may run that
-script on a cluster node: docs/cluster.md). Output name convention: r2s-<env>-<student>-teacher (the launcher's family rule resolves it).
+script on a cluster node: docs/cluster.md). Output name convention: r2s-<env>-<teacher>-teacher-for-<student>, the Hub names of the release (the launcher's
+family rule resolves it).
 """
 
 from __future__ import annotations
