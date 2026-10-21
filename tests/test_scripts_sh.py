@@ -991,6 +991,11 @@ def test_port_precheck_names_the_holder_and_never_kills(tmp_path):
     assert rc == 0 and "CLEAR" in out and "FATAL" not in out
     rc, out = _bash(f". {COMMON}; port_precheck 6100 8265; echo NOT_REACHED", _env(tmp_path, **base))
     assert rc == 1 and "FATAL: port :6100 is already held:" in out
+    # a comma list (NEMO_GYM_URL's trial servers): each URL's port is ours
+    _fakes(tmp_path, state={"ss": ["LISTEN 0 128 127.0.0.1:8200 0.0.0.0:*", "LISTEN 0 128 127.0.0.1:6100 0.0.0.0:*"]})
+    rc, out = _bash(f". {COMMON}; port_precheck 6100 8200 -- http://127.0.0.1:8201,http://127.0.0.1:8200,"
+                    "http://127.0.0.1:6100; echo CLEAR", _env(tmp_path, **base))
+    assert rc == 0 and "CLEAR" in out and "FATAL" not in out, out
     # the session-port check before the driver (today's 7100-7131 loop): a WARN with the evidence, rc 0, no kill
     _fakes(tmp_path, state={"ss": "ESTAB 0 0 127.0.0.1:7101 127.0.0.1:51234"})
     env = _env(tmp_path, **base)

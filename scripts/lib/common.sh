@@ -234,14 +234,14 @@ port_expand() {  # "6100 7100-7131 8200" -> one port per line
 
 # A fixed port held by someone else on a shared machine: say who, before anything starts. Nothing is ever
 # killed here (a stale-process sweep is a job wrapper's business, with the wrapper's knowledge of ownership).
-port_precheck() {  # <ports...> [-- <urls...>]
+port_precheck() {  # <ports...> [-- <urls...>] (a URL may be a comma list: NEMO_GYM_URL's agent servers)
   local ports='' skip='' p u host_port listing line
   while [ $# -gt 0 ]; do
     [ "$1" != -- ] || { shift; break; }
     ports="$ports $1"
     shift
   done
-  for u in "$@"; do
+  for u in ${*//,/ }; do
     host_port=${u#*://}
     host_port=${host_port%%/*}
     case "$host_port" in

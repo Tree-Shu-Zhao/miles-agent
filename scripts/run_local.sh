@@ -30,7 +30,7 @@
 #   POLICY_MODEL POLICY_HF            the policy (Qwen3.5-4B under $MILES_AGENT_MODELS)
 #   TEACHER_MODEL / TEACHER_HF / TEACHER_URL   the OPD teacher of a *_teacher topology: the LAST node serves it
 #                                     (scripts/teacher_node.sh) unless TEACHER_URL names a serving one (one node fewer)
-#   NEMO_GYM_URL                      preset = an external agent server, this run starts no gym (tmax: required)
+#   NEMO_GYM_URL                      preset = external agent server(s), a comma list; this run starts no gym (tmax: required)
 #   RETRIEVER_URL                     search_r1: the external retriever (a job wrapper's bridge sets it)
 #   GYM_VENV_ROOT                     prebuilt gym venvs (scripts/build_gym_venvs.sh); unset = `uv run` from 3rdparty/Gym
 #   RUN_SCRIPT                        the driver under recipes/<recipe>/ (default run.py; eval_full.py, opd.py)
