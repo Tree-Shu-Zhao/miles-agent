@@ -17,6 +17,7 @@
 #                             search_r1's retriever_base_url=$RETRIEVER_URL (the config file is never edited)
 #   DRIVER_DATA_ARGS          `--prompt-data P --eval-data E` (tmax: `--prompt-data P`)
 #   RECIPE_RUN_ARGS           tmax only: `--run-tag --eval-prompt-data --nemo-gym-url --session-server-external-host`
+#                             (TOPOLOGY=fully_async: `--train-nodes --rollout-nodes` too)
 #   RECIPE_PREPARE_DATA       function: build + validate the data files
 #   RECIPE_PROBE              function: import-probe the prebuilt gym venvs it will start (`:` without GYM_VENV_ROOT)
 #   RECIPE_PRE_RAY            function: services needed before ray comes up (search_r1: the retriever probe)
@@ -190,6 +191,9 @@ recipe_vars() {  # <recipe>
       RECIPE_PRE_GYM=:
       # EVAL_PROMPT_DATA is a PATH: run.py renders `--eval-prompt-data tmax <path>` and adds the `tmax` name itself
       RECIPE_RUN_ARGS="--run-tag $RUN_TAG ${EVAL_PROMPT_DATA:+--eval-prompt-data $EVAL_PROMPT_DATA} --nemo-gym-url $NEMO_GYM_URL ${SESSION_SERVER_EXTERNAL_HOST:+--session-server-external-host $SESSION_SERVER_EXTERNAL_HOST}"
+      # fully_async: the node split run_local.sh checked against NNODES; run.py has its own defaults (1 + 3) otherwise
+      [ "${TOPOLOGY:-}" != fully_async ] \
+        || RECIPE_RUN_ARGS="$RECIPE_RUN_ARGS --train-nodes ${TRAIN_NODES:?} --rollout-nodes ${ROLLOUT_NODES:?}"
       ;;
     *) echo "FATAL: unknown RECIPE=$RECIPE (alfworld | scienceworld | webshop | search_r1 | tmax)"; exit 1 ;;
   esac

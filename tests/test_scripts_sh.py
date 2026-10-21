@@ -1515,6 +1515,12 @@ def test_tmax_ladder_needs_a_preset_gym_url(tmp_path):
     assert rra == ["--run-tag", "t1", "--eval-prompt-data", "/e.jsonl", "--nemo-gym-url", "http://192.0.2.7:8200",
                    "--session-server-external-host", "192.0.2.9"]
     assert "tmax" not in rra  # run.py adds the `tmax` name itself: `--eval-prompt-data tmax <path>`
+    # fully_async: the node split run_local.sh checked (run.py's own defaults are 1 + 3)
+    rc, out = _ladder(f"run_dirs t1; recipe_vars tmax; {LADDER_ECHO}",
+                      _env(tmp_path, TOPOLOGY="fully_async", TRAIN_NODES="1", ROLLOUT_NODES="7", **base))
+    assert rc == 0, out
+    rra = shlex.split(re.search(r"RRA=\[(.*?)\]", out).group(1))
+    assert rra[-4:] == ["--train-nodes", "1", "--rollout-nodes", "7"]
     # no gym ladder: the hooks are no-ops, the probe gate passes even with a prebuilt root
     env = _env(tmp_path, GYM_VENV_ROOT="/r", **base)
     rc, out = _ladder('run_dirs t1; recipe_vars tmax; "$RECIPE_PREPARE_DATA"; venv_probe_gate; "$RECIPE_PRE_RAY"; '
@@ -1929,6 +1935,14 @@ def test_run_local_dry_run_prints_the_argv_per_recipe(tmp_path):
                                    "Qwen3.5-4B", "--hf-checkpoint", hf, "--ref-load", f"{m}/torch_dist_v5/Qwen3.5-4B_torch_dist",
                                    "--save-dir", f"{r}/T/", "--prompt-data", "/p.jsonl", "--run-tag", "T", "--nemo-gym-url",
                                    "http://192.0.2.7:8200", "--preempt-sentinel", f"{r}/T/stop"]
+    # fully_async on 2 nodes: the split reaches the driver (1 training node, the rest rollout)
+    rc, out = _entry(tmp_path, "--dry-run", "--recipe", "tmax", "--run-tag", "T",
+                     env=_env(tmp_path, TOPOLOGY="fully_async", NNODES="2", **{**roots, "NEMO_GYM_URL": "http://192.0.2.7:8200",
+                                                                                 "PROMPT_DATA": "/p.jsonl"}))
+    assert rc == 0, out
+    argv = _dry(out, "driver")
+    assert argv[argv.index("--num-nodes") + 1] == "2"
+    assert argv[argv.index("--train-nodes") + 1] == "1" and argv[argv.index("--rollout-nodes") + 1] == "1"
     # the usage gates
     rc, out = _entry(tmp_path, "--dry-run", "--run-tag", "T", env=_env(tmp_path, **roots))
     assert rc == 1 and "FATAL: --recipe (or RECIPE=) is required: scripts/run_local.sh" in out
