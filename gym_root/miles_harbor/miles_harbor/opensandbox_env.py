@@ -23,7 +23,13 @@ OpenSandbox server needs.
   most (the server's TTL; ``sandbox_timeout_sec``): a run that died leaves its sandboxes for that long, and
   ``sweep`` kills them at once;
 - httpx's INFO line per request is dropped for the server's requests (QuietServerRequests): a trial makes one per
-  command and each names the server; their warnings and errors stay.
+  command and each names the server; their warnings and errors stay;
+- the server rate-limits creates: a create it defers answers 429 with a Retry-After, and nothing was created. Every
+  connection retries a POST answered 429 after that wait (retry_policy; the SDK retries only idempotent methods by
+  itself), on top of Harbor's own three create attempts. Each retry of the SDK is counted by cause, and a line
+  ``OPENSANDBOX_RETRY cause=<cause> n=<since its last line> total=<n> backoff_s=<s> <method> <path>`` logs a cause
+  at its first retry and then at most every RETRY_LOG_S seconds (RetryLog). Creates in flight in a process are
+  bounded, each through its readiness wait (OPENSANDBOX_MAX_CREATES, default MAX_CREATES; 0: no bound).
 
 The trial server's hooks (trial_server.Backend): ``unrunnable_tasks`` stops the server on a task OpenSandbox cannot
 run (one image, prebuilt: no Dockerfile build, no compose; a network it keeps from create to delete: public or none,
@@ -40,17 +46,21 @@ Neither command prints the server's address: ``<endpoint>`` stands for it in the
 
 import argparse
 import asyncio
+import dataclasses
 import logging
 import os
 import re
 import ssl
 import sys
 import time
+import weakref
+from collections import Counter
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from harbor.environments.base import ExecResult
 from harbor.environments.opensandbox import OpenSandboxEnvironment as HarborOpenSandboxEnvironment
@@ -62,6 +72,11 @@ ENDPOINT_VARS = ("OPENSANDBOX_ENDPOINT", "OPENSANDBOX_DOMAIN")
 KEY_VARS = ("OPENSANDBOX_KEY", "OPENSANDBOX_API_KEY")
 CA_FILE_VAR = "OPENSANDBOX_CA_FILE"
 PROXY_VAR = "OPENSANDBOX_PROXY"
+MAX_CREATES_VAR = "OPENSANDBOX_MAX_CREATES"
+# creates in flight at once in a process (the server asks its clients to keep them bounded and back off on 429)
+MAX_CREATES = 32
+# a retry cause's OPENSANDBOX_RETRY line at most this often: a burst of 429s is a line, not one per request
+RETRY_LOG_S = 30
 # the server's TTL for a sandbox: past every trial's timeouts (TMax: agent 1 h, verifier 10 min; trial_timeout_s 2 h)
 SANDBOX_TIMEOUT_S = 6 * 3600
 # how long past timeout_sec a command's stream may stay silent before exec gives up on it
@@ -121,6 +136,77 @@ def joined_lines(messages: Iterable[Any]) -> str:
     return "".join(m.text if m.text.endswith("\n") else m.text + "\n" for m in messages)
 
 
+class RetryLog:
+    """The SDK's retries in this process by cause (its RetryCause: ``status_429``, ``status_503``...): ``total``
+    counts them, and a cause's OPENSANDBOX_RETRY line is logged at its first retry, then at most every RETRY_LOG_S
+    seconds with the count since its last line. The request's path is logged, never its host."""
+
+    def __init__(self) -> None:
+        self.total: Counter[str] = Counter()
+        self._since: Counter[str] = Counter()
+        self._logged: dict[str, float] = {}
+
+    def note(self, event: Any) -> None:
+        cause = str(getattr(event.cause, "value", event.cause))
+        self.total[cause] += 1
+        self._since[cause] += 1
+        now = time.monotonic()
+        last = self._logged.get(cause)
+        if last is not None and now - last < RETRY_LOG_S:
+            return
+        logger.warning(
+            "OPENSANDBOX_RETRY cause=%s n=%d total=%d backoff_s=%.1f %s %s",
+            cause,
+            self._since[cause],
+            self.total[cause],
+            event.backoff.total_seconds(),
+            event.method,
+            urlsplit(event.url).path,
+        )
+        self._since[cause] = 0
+        self._logged[cause] = now
+
+
+RETRIES = RetryLog()
+
+
+def retry_policy(base: Any) -> Any:
+    """``base`` (the SDK's RetryPolicy) retrying a POST or PATCH answered 429 too, after the server's Retry-After:
+    the server defers a create it rate-limits that way, and nothing was done. Every retry goes to RETRIES (after
+    ``base``'s own hook, if any)."""
+    from http import HTTPStatus
+
+    hook = base.on_retry
+
+    def on_retry(event: Any) -> None:
+        if hook is not None:
+            hook(event)
+        RETRIES.note(event)
+
+    return dataclasses.replace(
+        base,
+        retryable_status_codes_non_idempotent=frozenset(base.retryable_status_codes_non_idempotent)
+        | {HTTPStatus.TOO_MANY_REQUESTS},
+        on_retry=on_retry,
+    )
+
+
+_create_slots: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
+
+
+def create_slots() -> asyncio.Semaphore | None:
+    """The running event loop's bound on creates in flight (OPENSANDBOX_MAX_CREATES, else MAX_CREATES), or None for
+    0 (no bound). The first call in a loop sets its size."""
+    size = int(os.environ.get(MAX_CREATES_VAR) or MAX_CREATES)
+    if size <= 0:
+        return None
+    loop = asyncio.get_running_loop()
+    slots = _create_slots.get(loop)
+    if slots is None:
+        slots = _create_slots[loop] = asyncio.Semaphore(size)
+    return slots
+
+
 def pinned_transport(retry_policy: Any, ca_file: str | None, proxy: str | None) -> Any:
     """The SDK's default transport stack (an httpx.AsyncHTTPTransport, retry-wrapped as its policy wants, its
     limits) trusting ``ca_file`` too and going through ``proxy``. Its owner closes it: the SDK leaves a transport it
@@ -156,6 +242,7 @@ def connection_config(
     fields["protocol"] = endpoint_scheme(domain) or "https"
     if request_timeout_sec is not None:
         fields["request_timeout"] = timedelta(seconds=request_timeout_sec)
+    fields["retry_policy"] = retry_policy(ConnectionConfig(**fields).retry_policy)
     config = ConnectionConfig(**fields)
     ca_file = ca_file or os.environ.get(CA_FILE_VAR) or None
     proxy = proxy or os.environ.get(PROXY_VAR) or None
@@ -209,15 +296,24 @@ class OpenSandboxEnvironment(HarborOpenSandboxEnvironment):
 
     def _build_connection_config(self, sdk: dict[str, Any]) -> Any:
         config = super()._build_connection_config(sdk)
+        fields = {name: getattr(config, name) for name in config.model_fields_set}
+        fields["retry_policy"] = retry_policy(config.retry_policy)
         if not (self._ca_file or self._proxy):
-            return config
+            return type(config)(**fields)
         # one transport for every connection of this environment (each create attempt, the sandbox's adapters),
         # closed by stop(); the config is built anew so that the SDK knows the transport is not its own to close.
         # The SDK's create-latency report has a client of its own, which could not verify this server: off.
         if self._transport is None:
-            self._transport = pinned_transport(config.retry_policy, self._ca_file, self._proxy)
-        fields = {name: getattr(config, name) for name in config.model_fields_set}
+            self._transport = pinned_transport(fields["retry_policy"], self._ca_file, self._proxy)
         return type(config)(**fields, transport=self._transport, disable_metrics=True)
+
+    async def _create_sandbox(self, sdk: dict[str, Any]) -> Any:
+        # Harbor's create (its three attempts and the readiness wait) holds one of the process's create slots
+        slots = create_slots()
+        if slots is None:
+            return await super()._create_sandbox(sdk)
+        async with slots:
+            return await super()._create_sandbox(sdk)
 
     async def stop(self, delete: bool) -> None:
         try:

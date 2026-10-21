@@ -8,6 +8,7 @@ import re
 import ssl
 import sys
 from datetime import timedelta
+from http import HTTPStatus
 from types import SimpleNamespace
 
 import pytest
@@ -32,7 +33,7 @@ from miles_harbor.opensandbox_env import (  # noqa: E402
     run_label,
     unrunnable_tasks,
 )
-from opensandbox.transport import unwrap_retry_transport  # noqa: E402
+from opensandbox.transport import RetryAsyncTransport, RetryPolicy, unwrap_retry_transport  # noqa: E402
 
 ENDPOINT = "https://sandbox.example.test:8443"
 SERVER_VARS = ("OPENSANDBOX_ENDPOINT", "OPENSANDBOX_DOMAIN", "OPENSANDBOX_KEY", "OPENSANDBOX_API_KEY")
@@ -224,6 +225,102 @@ def test_a_ca_file_and_a_proxy_are_one_transport_of_the_environments_own(tmp_pat
         make_env(tmp_path)._build_connection_config(sdk)
     with pytest.raises(ValueError, match="no CA file"):
         ose.connection_config()
+
+
+@pytest.fixture
+def retries(monkeypatch):
+    """A RetryLog of the test's own."""
+    log = ose.RetryLog()
+    monkeypatch.setattr(ose, "RETRIES", log)
+    return log
+
+
+async def test_a_post_answered_429_is_retried_after_its_retry_after(retries, caplog):
+    # the server defers a create it rate-limits: 429 + Retry-After, nothing created; the SDK alone would not retry it
+    assert HTTPStatus.TOO_MANY_REQUESTS not in RetryPolicy().retryable_statuses_for("POST")
+    policy = ose.retry_policy(RetryPolicy())
+    assert HTTPStatus.TOO_MANY_REQUESTS in policy.retryable_statuses_for("POST") and policy.max_retries == 3
+    statuses = [429, 429, 200]
+    seen = []
+
+    def server(request):
+        seen.append((request.method, request.url.path))
+        return httpx.Response(statuses[len(seen) - 1], headers={"Retry-After": "0"})
+
+    transport = RetryAsyncTransport(httpx.MockTransport(server), policy, owns_inner=True)
+    with caplog.at_level(logging.WARNING, logger=ose.__name__):
+        async with httpx.AsyncClient(transport=transport) as client:
+            answer = await client.post("https://sandbox.example.test:8443/v1/sandboxes", json={"image": "x"})
+    assert answer.status_code == 200 and seen == [("POST", "/v1/sandboxes")] * 3
+    assert retries.total == {"status_429": 2}
+    # a burst is one line: the cause's first retry, its count since the last line, the path but never the host
+    assert [m for m in caplog.messages if m.startswith("OPENSANDBOX_RETRY")] == [
+        "OPENSANDBOX_RETRY cause=status_429 n=1 total=1 backoff_s=0.0 POST /v1/sandboxes"
+    ]
+
+
+def test_a_causes_retries_are_a_line_per_interval(retries, caplog, monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(ose.time, "monotonic", lambda: now[0])
+    event = SimpleNamespace(
+        cause=SimpleNamespace(value="status_429"), backoff=timedelta(seconds=2), method="POST", url=ENDPOINT + "/v1/x"
+    )
+    with caplog.at_level(logging.WARNING, logger=ose.__name__):
+        for _ in range(5):
+            retries.note(event)
+        now[0] += ose.RETRY_LOG_S
+        retries.note(event)
+        retries.note(SimpleNamespace(**{**vars(event), "cause": SimpleNamespace(value="status_503")}))
+    assert [m for m in caplog.messages if m.startswith("OPENSANDBOX_RETRY")] == [
+        "OPENSANDBOX_RETRY cause=status_429 n=1 total=1 backoff_s=2.0 POST /v1/x",
+        "OPENSANDBOX_RETRY cause=status_429 n=5 total=6 backoff_s=2.0 POST /v1/x",
+        "OPENSANDBOX_RETRY cause=status_503 n=1 total=1 backoff_s=2.0 POST /v1/x",
+    ]
+    assert retries.total == {"status_429": 6, "status_503": 1}
+
+
+def test_every_connection_retries_a_post_answered_429(tmp_path, server, monkeypatch, transports, retries):
+    sdk = make_env(tmp_path)._load_opensandbox()
+    policies = []
+    pinned = ose.pinned_transport
+
+    def recording(policy, *args):
+        policies.append(policy)
+        return pinned(policy, *args)
+
+    monkeypatch.setattr(ose, "pinned_transport", recording)
+    # the SDK's own transport (no CA file, no proxy), then the pinned one, for the environment and the CLI alike
+    configs = [make_env(tmp_path)._build_connection_config(sdk), ose.connection_config()[0]]
+    monkeypatch.setenv("OPENSANDBOX_CA_FILE", certifi.where())
+    configs += [make_env(tmp_path)._build_connection_config(sdk), ose.connection_config()[0]]
+    for config in configs:
+        assert HTTPStatus.TOO_MANY_REQUESTS in config.retry_policy.retryable_statuses_for("POST")
+    assert configs[0].transport is None and configs[1].transport is None
+    assert policies == [configs[2].retry_policy, configs[3].retry_policy]
+    assert isinstance(configs[2].transport, RetryAsyncTransport)
+
+
+async def test_creates_in_flight_are_bounded_per_process(tmp_path, server, monkeypatch):
+    inside, peak = 0, 0
+
+    async def create(self, sdk):
+        nonlocal inside, peak
+        inside += 1
+        peak = max(peak, inside)
+        await asyncio.sleep(0.01)
+        inside -= 1
+        return "sandbox"
+
+    monkeypatch.setattr(ose.HarborOpenSandboxEnvironment, "_create_sandbox", create)
+    envs = [make_env(tmp_path) for _ in range(10)]
+    monkeypatch.setenv("OPENSANDBOX_MAX_CREATES", "3")
+    assert await asyncio.gather(*(env._create_sandbox({}) for env in envs)) == ["sandbox"] * 10
+    assert peak == 3
+    # 0: no bound
+    peak = 0
+    monkeypatch.setenv("OPENSANDBOX_MAX_CREATES", "0")
+    await asyncio.gather(*(env._create_sandbox({}) for env in envs))
+    assert peak == 10
 
 
 async def test_a_sandbox_is_created_with_the_runs_label_and_the_servers_ttl(
