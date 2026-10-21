@@ -4,6 +4,7 @@
 [![Python](https://img.shields.io/badge/Python-3.13-green.svg)](https://www.python.org/)
 [![miles](https://img.shields.io/badge/miles-0.1.2-blue.svg)](https://github.com/radixark/miles)
 [![NeMo Gym](https://img.shields.io/badge/NeMo%20Gym-0.7.0-76b900.svg)](https://github.com/NVIDIA-NeMo/Gym)
+[![Harbor](https://img.shields.io/badge/Harbor-0.24.0-orange.svg)](https://github.com/harbor-framework/harbor)
 
 > **Personal research code**, not a product: this repository may be heavily deleted or refactored at any time.
 > Each paper's reproduction is pinned by a release tag named after the paper ([Papers](#-papers)); `main` moves on.
