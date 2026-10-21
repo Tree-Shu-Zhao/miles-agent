@@ -82,7 +82,7 @@ SANDBOX_TIMEOUT_S = 6 * 3600
 # how long past timeout_sec a command's stream may stay silent before exec gives up on it
 STREAM_GRACE_S = 60
 RUN_LABEL = "miles-harbor-run"
-# kills in flight at once in a sweep: a run's sandboxes go within a step's kill grace (Slurm's KillWait)
+# kills in flight at once in a sweep: a run's sandboxes go within the grace a launcher's cleanup gets before a kill
 SWEEP_CONCURRENCY = 16
 COMPOSE_FILES = ("docker-compose.yaml", "docker-compose.yml")
 CHECK_OUTPUT = "a\n\nb\n"  # printf's: two lines around an empty one
