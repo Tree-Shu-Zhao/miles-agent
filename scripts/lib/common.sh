@@ -235,18 +235,22 @@ port_expand() {  # "6100 7100-7131 8200" -> one port per line
 # A fixed port held by someone else on a shared machine: say who, before anything starts. Nothing is ever
 # killed here (a stale-process sweep is a job wrapper's business, with the wrapper's knowledge of ownership).
 port_precheck() {  # <ports...> [-- <urls...>] (a URL may be a comma list: NEMO_GYM_URL's agent servers)
-  local ports='' skip='' p u host_port listing line
+  local ports='' skip='' p u list host_port listing line
+  local -a urls
   while [ $# -gt 0 ]; do
     [ "$1" != -- ] || { shift; break; }
     ports="$ports $1"
     shift
   done
-  for u in ${*//,/ }; do
-    host_port=${u#*://}
-    host_port=${host_port%%/*}
-    case "$host_port" in
-      *:*) skip="$skip ${host_port##*:}" ;;
-    esac
+  for list in "$@"; do
+    IFS=, read -r -a urls <<< "$list"
+    for u in ${urls[@]+"${urls[@]}"}; do
+      host_port=${u#*://}
+      host_port=${host_port%%/*}
+      case "$host_port" in
+        *:*) skip="$skip ${host_port##*:}" ;;
+      esac
+    done
   done
   if ! command -v ss >/dev/null 2>&1; then
     echo "WARN: no ss on PATH: port pre-check skipped"
