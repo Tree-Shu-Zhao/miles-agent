@@ -90,7 +90,8 @@ class Server:
 # the sandbox's paths the harness and the tests use, each where a path begins
 SANDBOX_PATHS = re.compile(r"(?<![\w./-])/(?:tmp/|workspace\b|output\b|logs/|root\b|app\b)")
 
-# GNU timeout where the host has none (macOS): the command in a process group of its own, killed whole at the limit
+# GNU timeout where the host has none (macOS): the command in a process group of its own, killed whole at the limit,
+# stopped first: a shell the kill reached after its child would report the child's death ("Killed: 9") in the output
 TIMEOUT_SHIM = f"""#!{sys.executable}
 import os, signal, subprocess, sys
 args = sys.argv[1:]
@@ -101,6 +102,7 @@ child = subprocess.Popen(args, start_new_session=True)
 try:
     sys.exit(child.wait(timeout=limit))
 except subprocess.TimeoutExpired:
+    os.killpg(child.pid, signal.SIGSTOP)
     os.killpg(child.pid, signal.SIGKILL)
     child.wait()
     sys.exit(124)
@@ -108,10 +110,11 @@ except subprocess.TimeoutExpired:
 
 
 class Environment:
-    """Runs commands with bash, the sandbox's / at ``root`` (its absolute paths in a command rewritten under it)."""
+    """Runs commands with bash, the sandbox's / at ``root`` (its absolute paths in a command rewritten under it); its
+    output one stream (stderr in stdout), as Harbor's docker environment gives it, or ``apart``, as OpenSandbox's."""
 
-    def __init__(self, root):
-        self.root, self.commands = root, []
+    def __init__(self, root, apart=False):
+        self.root, self.apart, self.commands = root, apart, []
         self.env = dict(os.environ)
         if shutil.which("timeout") is None:
             shim = root.parent / "bin" / "timeout"
@@ -123,10 +126,9 @@ class Environment:
     async def exec(self, command, cwd=None, env=None, timeout_sec=None, user=None):
         self.commands.append((command, timeout_sec))
         command = SANDBOX_PATHS.sub(lambda m: f"{self.root}{m.group(0)}", command)
-        done = subprocess.run(
-            ["bash", "-c", "exec 2>&1\n" + command], capture_output=True, text=True, cwd=self.root, env=self.env
-        )
-        return SimpleNamespace(stdout=done.stdout or None, stderr=None, return_code=done.returncode)
+        script = command if self.apart else "exec 2>&1\n" + command
+        done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, cwd=self.root, env=self.env)
+        return SimpleNamespace(stdout=done.stdout or None, stderr=done.stderr or None, return_code=done.returncode)
 
 
 @pytest.fixture
@@ -136,7 +138,7 @@ def root(tmp_path):
     return tmp_path / "sb"
 
 
-async def run_agent(tmp_path, root, replies, **kwargs):
+async def run_agent(tmp_path, root, replies, apart=False, **kwargs):
     server = Server(replies)
     agent = VanilluxAgent(
         logs_dir=tmp_path / "agent",
@@ -144,7 +146,7 @@ async def run_agent(tmp_path, root, replies, **kwargs):
         extra_env={"OPENAI_BASE_URL": server.url, "OPENAI_API_KEY": "EMPTY"},
         **kwargs,
     )
-    environment = Environment(root)
+    environment = Environment(root, apart=apart)
     await agent.setup(environment)
     context = AgentContext()
     await agent.run("  Do the task.  ", environment, context)
@@ -266,6 +268,24 @@ async def test_a_command_past_its_timeout_is_told_so(tmp_path, root):
         "started\n\nCommand timed out after 1s.\n\n\n(exit_code=124)"
     )
     assert environment.commands[1] == (bash_command("echo started; sleep 5", 1), 31)
+
+
+async def test_stderr_follows_stdout_as_tmax_puts_them_when_the_backend_gives_them_apart(tmp_path, root):
+    # OpenSandbox's exec gives the streams apart, as TMax's docker exec did: stdout, a newline, then stderr, the
+    # timeout's notice leading it
+    replies = [
+        reply(call("echo out; echo err >&2; exit 2")),
+        reply(call("echo err >&2", "c2")),
+        reply(call("echo started; echo warn >&2; sleep 5", "c3")),
+        reply(call(f"echo {SUBMIT_MARKER}", "c4")),
+    ]
+    server, _, _, outcome = await run_agent(tmp_path, root, replies, apart=True, command_timeout=1)
+    assert outcome.submitted
+    assert [m["content"] for m in server.requests[3]["messages"] if m["role"] == "tool"] == [
+        "out\n\nerr\n\n\n(exit_code=2)",
+        "err\n\n\n(exit_code=0)",
+        "started\n\nCommand timed out after 1s.\nwarn\n\n\n(exit_code=124)",
+    ]
 
 
 async def test_a_command_with_a_nul_byte_is_a_failed_step_as_tmaxs_rollout_answers_it(tmp_path, root):

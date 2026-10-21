@@ -12,8 +12,9 @@ What the model sees is TMax's training environment's, verbatim:
   exported environment and cds to its directory, and saves both after it (cwd /app to begin with, linked to
   /workspace when the image has no /app); ``timeout --signal=TERM --kill-after=10 <command_timeout>`` around it, a
   timeout told as ``Command timed out after <n>s.``;
-- an observation: the output (head and tail 5,000 characters with mini-swe-agent's too-long hint past 10,000),
-  ``(no output)`` for none, then ``(exit_code=N)``; a command with a NUL byte, which no process takes as an argument
+- an observation: the output, its stdout then its stderr after a newline, the timeout notice leading stderr (head and
+  tail 5,000 characters with mini-swe-agent's too-long hint past 10,000), ``(no output)`` for none, then
+  ``(exit_code=N)``; a command with a NUL byte, which no process takes as an argument
   (TMax's docker exec raised on it), gets what TMax's rollout answers a step that raised, ``Step 'bash' failed:
   <error>. Args: <arguments>``, and the episode goes on;
 - every ``bash`` call of a reply runs, in order, each one step, as TMax's rollout runs a reply's calls (its
@@ -33,9 +34,9 @@ What the model sees is TMax's training environment's, verbatim:
   and the new observations' estimated (UTF-8 bytes / OBS_BYTES_PER_TOKEN, an overestimate), and the episode ends
   once less than MIN_REPLY_TOKENS is left, or the server refuses a request as too long.
 
-Where it differs from TMax's training environment: the sandbox's output is one stream, stdout and stderr
-interleaved as written (Harbor's exec, as docker compose exec gives it), where TMax read them apart and put stderr
-after stdout; the timeout notice follows the output instead of leading stderr.
+Where it can differ from TMax's training environment: a backend whose exec gives one stream (Harbor's docker
+environment, as docker compose exec gives it: stderr in stdout) shows stdout and stderr interleaved as written, the
+timeout notice after them; one that gives them apart, as TMax's docker exec did (OpenSandbox), shows TMax's.
 
 The model is called at the server Harbor's agent config names (its env: OPENAI_BASE_URL, OPENAI_API_KEY; the
 model_name as the server knows it), through the OpenAI client, from this process: the env is not exported into the
@@ -66,7 +67,7 @@ from miles_harbor.harness_api import Endpoint, Outcome
 
 logger = logging.getLogger(__name__)
 
-VERSION = "tmax-6d3d606c+miles1"
+VERSION = "tmax-6d3d606c+miles2"
 SUBMIT_MARKER = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 
 # vanillux_prompts.yaml (open_instruct/environments), verbatim; the training system prompt
@@ -352,7 +353,8 @@ class VanilluxAgent(BaseAgent):
     async def setup(self, environment: BaseEnvironment) -> None:
         result = await environment.exec(command=PREPARE, timeout_sec=60)
         if result.return_code != 0:
-            raise RuntimeError(f"vanillux: the shell's setup failed (rc={result.return_code}): {result.stdout}")
+            output = (result.stdout or "") + (result.stderr or "")
+            raise RuntimeError(f"vanillux: the shell's setup failed (rc={result.return_code}): {output}")
 
     async def run(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
         messages: list[dict[str, Any]] = [
@@ -480,7 +482,8 @@ class VanilluxAgent(BaseAgent):
         raise AssertionError("unreachable")
 
     async def _bash(self, environment: BaseEnvironment, command: str) -> tuple[str, int]:
-        """One step's command in the sandbox: its output (one stream) and exit code; a timeout as TMax tells it."""
+        """One step's command in the sandbox: its output and exit code, as TMax puts them together (stdout, then stderr
+        after a newline, a timeout's notice leading stderr)."""
         notice = f"Command timed out after {self.command_timeout}s.\n"
         try:
             # Harbor's own timeout a margin past timeout's TERM and KILL, in case the sandbox stops answering
@@ -491,9 +494,11 @@ class VanilluxAgent(BaseAgent):
             if "timed out" not in str(e):
                 raise
             return notice, 124
-        output = result.stdout or ""
+        output, stderr = result.stdout or "", result.stderr or ""
         if result.return_code == 124:
-            output = f"{output}\n{notice}" if output else notice
+            stderr = notice + stderr
+        if stderr:
+            output = f"{output}\n{stderr}" if output else stderr
         return output, result.return_code
 
     @staticmethod
