@@ -3592,6 +3592,15 @@ def _fake_harnesses(tmp_path):
     return str(tmp_path / "fakepkg")
 
 
+def _no_harnesses(tmp_path):
+    """A miles_harbor on PYTHONPATH whose import fails: ahead of one the interpreter has installed (a dev venv's
+    editable install), so the builder's interpreter is without miles_harbor wherever the tests run."""
+    pkg = tmp_path / "nopkg" / "miles_harbor"
+    pkg.mkdir(parents=True, exist_ok=True)
+    (pkg / "__init__.py").write_text("raise ImportError('no miles_harbor (the test stands in for its absence)')\n")
+    return str(tmp_path / "nopkg")
+
+
 def test_harbor_trial_server_config_carries_sandbox_kwargs_only_with_a_provider(tmp_path):
     """--dry-run builds the server config (S2, D18) and starts nothing: with HARBOR_ENVIRONMENT_IMPORT_PATH naming a
     sandbox backend and a --provider, the config carries environment_import_path and the provider kwargs
@@ -3845,12 +3854,12 @@ def test_harbor_run_dry_run_builds_the_job_config(tmp_path):
     rc, out = _run_script(HARBOR_RUN, "--dry-run", "--out", str(out_dir), env=_env(tmp_path, HARBOR_DATASET="/d", HARBOR_AGENT_IMPORT_PATH="x.y:Z", **common))
     assert rc == 0 and _config_line(out, "HARBOR_JOB_CONFIG")["agents"] == [{"import_path": "x.y:Z"}]
     # without miles_harbor importable: a WARN and Harbor's own agent by name; with an endpoint file a FATAL
-    env = _env(tmp_path, HARBOR_DATASET="/d", HARBOR_AGENT="mini-swe-agent", **{k: v for k, v in common.items() if k != "PYTHONPATH"}, PYTHONPATH=str(tmp_path / "empty"))
+    env = _env(tmp_path, HARBOR_DATASET="/d", HARBOR_AGENT="mini-swe-agent", **{k: v for k, v in common.items() if k != "PYTHONPATH"}, PYTHONPATH=_no_harnesses(tmp_path))
     rc, out = _run_script(HARBOR_RUN, "--dry-run", "--out", str(out_dir), env=env)
     assert rc == 0 and "WARN: miles_harbor.harnesses is not importable by" in out, out
     assert _config_line(out, "HARBOR_JOB_CONFIG")["agents"] == [{"name": "mini-swe-agent"}]
     env = _env(tmp_path, HARBOR_DATASET="/d", HARBOR_AGENT="mini-swe-agent", HARBOR_ENDPOINT_FILE=str(endpoint),
-               HARBOR_PYTHON=sys.executable, PYTHONPATH=str(tmp_path / "empty"), **roots)
+               HARBOR_PYTHON=sys.executable, PYTHONPATH=_no_harnesses(tmp_path), **roots)
     rc, out = _run_script(HARBOR_RUN, "--dry-run", "--out", str(out_dir), env=env)
     assert rc == 1 and "FATAL: HARBOR_ENDPOINT_FILE needs the harness's ENDPOINT binding" in out
     # a sandbox backend without a provider: its import path, kwargs {} (HARBOR_ENVIRONMENT_KWARGS unset), no FATAL
