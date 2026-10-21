@@ -9,7 +9,7 @@
 
 ## 📖 Overview
 
-This repository holds the code of **R2S** (Rollout-to-Scorer Distillation), a teacher-repair step for agentic on-policy distillation, and the trainer wiring it runs on: [miles](https://github.com/radixark/miles) as the RL trainer (submodule `3rdparty/miles`, pinned plus the patches under `patches/miles/`) connected to NeMo Gym HTTP environments (submodule `3rdparty/Gym`) for ALFWorld, ScienceWorld and WebShop.
+This repository holds the code of **R2S** (Rollout-to-Scorer Distillation, [arXiv:2610.28586](https://arxiv.org/abs/2610.28586)), a teacher-repair step for agentic on-policy distillation, and the trainer wiring it runs on: [miles](https://github.com/radixark/miles) as the RL trainer (submodule `3rdparty/miles`, pinned plus the patches under `patches/miles/`) connected to NeMo Gym HTTP environments (submodule `3rdparty/Gym`) for ALFWorld, ScienceWorld and WebShop.
 
 Agentic on-policy distillation (OPD) trains a student on its own multi-turn episodes against a frozen teacher: the teacher scores every token the student wrote, the loss is the sampled reverse KL to those per-token log-probabilities, and the task reward is logged, never trained on. R2S repairs the teacher before that distillation starts, from a pilot dump of the untrained student's episodes:
 
@@ -29,7 +29,7 @@ The student is then distilled from the repaired teacher under the unchanged OPD 
 
 | paper | tag | document |
 |---|---|---|
-| R2S: Rollout-to-Scorer Distillation | `r2s` | `docs/r2s.md` |
+| [Capable Teacher, Myopic Scorer: Reward-Free Teacher Repair for Agentic On-Policy Distillation](https://arxiv.org/abs/2610.28586) (R2S: Rollout-to-Scorer Distillation) | `r2s` | `docs/r2s.md` |
 
 ## 📋 Table of Contents
 
@@ -218,7 +218,18 @@ miles-agent/
 
 ## 📚 Citation
 
-The paper is under review; the BibTeX entry will be added here with the preprint. To cite the software, use `CITATION.cff` (GitHub's "Cite this repository" button).
+If you use this code or the released checkpoints, please cite the paper ([arXiv:2610.28586](https://arxiv.org/abs/2610.28586)):
+
+```bibtex
+@article{zhao2026capable,
+  title={Capable Teacher, Myopic Scorer: Reward-Free Teacher Repair for Agentic On-Policy Distillation},
+  author={Zhao, Shu and Yu, Tan},
+  journal={arXiv preprint arXiv:2610.28586},
+  year={2026}
+}
+```
+
+To cite the software, use `CITATION.cff` (GitHub's "Cite this repository" button).
 
 ## ⚖️ License
 
