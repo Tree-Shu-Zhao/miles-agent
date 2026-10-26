@@ -1699,10 +1699,11 @@ def test_pre_gym_webshop_gates_the_engine_protocol_and_goal_set(tmp_path):
         _fakes(tmp_path, state={"curl": {health: "200"}, "curl_body": {health: body}, "python_c": "real",
                                 "rows": {"webshop_eval.jsonl": 756}, "goals_digest": "d1", **state})
         env = _env(tmp_path, RUN_TAG="T", **{**roots, **extra})
-        # the engine's fake logs its call and exits: the snippet waits for it, or the shell's exit cleanup may kill
-        # it before it logged (the launcher's bash and the interpreter take longer to start than the gates do to run)
+        # the engine's fake logs its call and exits: the snippet waits for it (when one was launched: not under
+        # --dry-run), or the shell's exit cleanup may kill it before it logged (the launcher's bash and the
+        # interpreter take longer to start than the gates do to run)
         rc, out = _ladder('run_dirs T; recipe_vars webshop; "$RECIPE_PREPARE_DATA" >/dev/null; pre_gym_webshop; '
-                          'wait "$ENGINE_PID"; echo "EL=${ENGINE_LOG:-}"', env)
+                          '[ -z "${ENGINE_PID:-}" ] || wait "$ENGINE_PID"; echo "EL=${ENGINE_LOG:-}"', env)
         return rc, out, env
 
     rc, out, env = run({})
