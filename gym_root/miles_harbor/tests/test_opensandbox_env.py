@@ -202,7 +202,9 @@ def test_a_ca_file_and_a_proxy_are_one_transport_of_the_environments_own(tmp_pat
     env = make_env(tmp_path)
     config = env._build_connection_config(sdk)
     assert env._build_connection_config(sdk).transport is config.transport and len(transports) == 1
-    assert unwrap_retry_transport(config.transport) is transports[0]
+    # under the SDK's retry wrapper, httpx's transport behind the proxy's refusals told as connect failures
+    pinned = unwrap_retry_transport(config.transport)
+    assert isinstance(pinned, ose.ProxyConnectFailures) and pinned.inner is transports[0]
     assert not config.owns_transport and config.disable_metrics
     assert (config.domain, config.api_key, config.protocol) == (
         ENDPOINT,
@@ -381,6 +383,73 @@ async def test_exec_answers_the_output_as_printed_and_a_timeout_as_dockers(tmp_p
     sandbox.answers = [silent]
     with pytest.raises(RuntimeError, match=r"^Command timed out after 1 seconds$"):
         await env.exec("sleep 9", timeout_sec=1)
+
+
+async def test_a_proxys_refused_connect_is_retried_as_a_connect_failure(retries):
+    # the SDK retries a connect failure on any method (nothing left the client) but a ProxyError on idempotent
+    # methods alone; a proxy that cannot reach the server refuses the CONNECT, which is the former
+    policy = ose.retry_policy(RetryPolicy(initial_backoff=timedelta(0), max_backoff=timedelta(0)))
+    calls = []
+
+    def server(request):
+        calls.append(request.method)
+        if len(calls) < 3:
+            raise httpx.ProxyError("CONNECT answered 502")
+        return httpx.Response(200)
+
+    bare = RetryAsyncTransport(httpx.MockTransport(server), policy, owns_inner=True)
+    async with httpx.AsyncClient(transport=bare) as client:
+        with pytest.raises(httpx.ProxyError):
+            await client.post("https://sandbox.example.test:8443/v1/sandboxes", json={})
+    assert calls == ["POST"] and retries.total == {}
+    calls.clear()
+    pinned = RetryAsyncTransport(ose.ProxyConnectFailures(httpx.MockTransport(server)), policy, owns_inner=True)
+    async with httpx.AsyncClient(transport=pinned) as client:
+        answer = await client.post("https://sandbox.example.test:8443/v1/sandboxes", json={})
+    assert answer.status_code == 200 and calls == ["POST"] * 3 and retries.total == {"pre_send": 2}
+    # past the policy's retries the failure is told as the connect failure it was taken for, the refusal its cause
+    calls.clear()
+    policy = ose.retry_policy(RetryPolicy(max_retries=1, initial_backoff=timedelta(0), max_backoff=timedelta(0)))
+    pinned = RetryAsyncTransport(ose.ProxyConnectFailures(httpx.MockTransport(server)), policy, owns_inner=True)
+    async with httpx.AsyncClient(transport=pinned) as client:
+        with pytest.raises(httpx.ConnectError, match="the proxy did not connect: CONNECT answered 502") as failed:
+            await client.post("https://sandbox.example.test:8443/v1/sandboxes", json={})
+    assert isinstance(failed.value.__cause__, httpx.ProxyError) and calls == ["POST"] * 2
+
+
+async def test_exec_retries_a_command_whose_connection_failed_before_it_ran(
+    tmp_path, server, monkeypatch, sandboxes, retries
+):
+    from opensandbox.exceptions import SandboxConnectionException
+
+    env = make_env(tmp_path)
+    await env.start(force_build=False)  # runs Harbor's setup commands in the sandbox
+    (sandbox,) = sandboxes
+    ran = len(sandbox.ran)
+    monkeypatch.setattr(ose, "EXEC_RETRY_BACKOFF_S", (0.0,))
+
+    def failing(error):
+        async def answer():
+            raise SandboxConnectionException("the stream failed", cause=error)
+
+        return answer
+
+    # the SDK keeps httpx's error as the cause: the proxy's CONNECT refused, then the TCP connect, then it ran
+    sandbox.answers = [failing(httpx.ProxyError("CONNECT 502")), failing(httpx.ConnectError("refused")), execution()]
+    assert (await env.exec("echo ok", timeout_sec=60)).return_code == 0
+    assert [command for command, _ in sandbox.ran[ran:]] == ["echo ok"] * 3
+    assert retries.total == {"exec_pre_send_ProxyError": 1, "exec_pre_send_ConnectError": 1}
+    # a failure once the command may have run (its stream broke) is not retried
+    sandbox.answers = [failing(httpx.ReadError("reset")), execution()]
+    with pytest.raises(SandboxConnectionException, match="the stream failed"):
+        await env.exec("echo ok")
+    assert len(sandbox.ran) == ran + 4
+    # nor one past the budget (OPENSANDBOX_EXEC_RETRY_S; 0: never)
+    monkeypatch.setenv("OPENSANDBOX_EXEC_RETRY_S", "0")
+    sandbox.answers = [failing(httpx.ConnectError("refused")), execution()]
+    with pytest.raises(SandboxConnectionException):
+        await env.exec("echo ok")
+    assert len(sandbox.ran) == ran + 5 and retries.total["exec_pre_send_ConnectError"] == 1
 
 
 def test_httpxs_line_per_request_to_the_server_is_dropped(tmp_path, server, caplog):

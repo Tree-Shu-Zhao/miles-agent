@@ -29,7 +29,13 @@ OpenSandbox server needs.
   itself), on top of Harbor's own three create attempts. Each retry of the SDK is counted by cause, and a line
   ``OPENSANDBOX_RETRY cause=<cause> n=<since its last line> total=<n> backoff_s=<s> <method> <path>`` logs a cause
   at its first retry and then at most every RETRY_LOG_S seconds (RetryLog). Creates in flight in a process are
-  bounded, each through its readiness wait (OPENSANDBOX_MAX_CREATES, default MAX_CREATES; 0: no bound).
+  bounded, each through its readiness wait (OPENSANDBOX_MAX_CREATES, default MAX_CREATES; 0: no bound);
+- a connection that failed before the request left (TCP connect, TLS, the proxy's CONNECT, the wait for a pooled
+  connection) ran nothing, so it is retried: on the SDK's lifecycle calls by its own policy (a proxy's refusal is
+  told as a connect failure first, ProxyConnectFailures: the SDK retries a ProxyError on idempotent methods alone),
+  and on a command by ``exec`` itself (the SDK's command stream bypasses its retry wrapper), waiting
+  EXEC_RETRY_BACKOFF_S between attempts within OPENSANDBOX_EXEC_RETRY_S seconds of the first (default EXEC_RETRY_S;
+  0: no retry), each counted as ``exec_pre_send_<error>`` in the OPENSANDBOX_RETRY lines.
 
 The trial server's hooks (trial_server.Backend): ``unrunnable_tasks`` stops the server on a task OpenSandbox cannot
 run (one image, prebuilt: no Dockerfile build, no compose; a network it keeps from create to delete: public or none,
@@ -62,6 +68,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+import httpx
 from harbor.environments.base import ExecResult
 from harbor.environments.opensandbox import OpenSandboxEnvironment as HarborOpenSandboxEnvironment
 from harbor.models.task.config import NetworkMode, TaskConfig
@@ -75,6 +82,13 @@ PROXY_VAR = "OPENSANDBOX_PROXY"
 MAX_CREATES_VAR = "OPENSANDBOX_MAX_CREATES"
 # creates in flight at once in a process (the server asks its clients to keep them bounded and back off on 429)
 MAX_CREATES = 32
+EXEC_RETRY_VAR = "OPENSANDBOX_EXEC_RETRY_S"
+# a command whose connection failed before it ran is retried within this many seconds of its first attempt
+EXEC_RETRY_S = 30.0
+# the waits before each such retry; the last repeats
+EXEC_RETRY_BACKOFF_S = (0.5, 1.0, 2.0, 4.0, 8.0)
+# httpx's failures before a request left: a retry runs nothing twice
+PRE_SEND_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError, httpx.PoolTimeout)
 # a retry cause's OPENSANDBOX_RETRY line at most this often: a burst of 429s is a line, not one per request
 RETRY_LOG_S = 30
 # the server's TTL for a sandbox: past every trial's timeouts (TMax: agent 1 h, verifier 10 min; trial_timeout_s 2 h)
@@ -207,12 +221,59 @@ def create_slots() -> asyncio.Semaphore | None:
     return slots
 
 
+def pre_send_failure(error: BaseException) -> BaseException | None:
+    """The httpx error in ``error``'s cause chain that failed before the request left (PRE_SEND_ERRORS: TCP connect,
+    TLS, the proxy's CONNECT, the wait for a pooled connection), else None. The SDK wraps one keeping it as the cause
+    (SandboxConnectionException, SandboxTimeoutException); a read or write error is not one: the command may have
+    run."""
+    seen: set[int] = set()
+    link: BaseException | None = error
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        if isinstance(link, PRE_SEND_ERRORS):
+            return link
+        link = link.__cause__ or link.__context__
+    return None
+
+
+def exec_retry_s() -> float:
+    """How long after a command's first attempt its pre-send failures are retried (OPENSANDBOX_EXEC_RETRY_S, else
+    EXEC_RETRY_S); 0: not at all."""
+    return float(os.environ.get(EXEC_RETRY_VAR) or EXEC_RETRY_S)
+
+
+@dataclasses.dataclass(frozen=True)
+class ExecRetry:
+    """A command's retry as RetryLog.note takes it (the SDK's RetryEvent stands for its own)."""
+
+    cause: str
+    backoff: timedelta
+    method: str = "POST"
+    url: str = "/exec"
+
+
+class ProxyConnectFailures(httpx.AsyncBaseTransport):
+    """``inner`` with a proxy's refusal of a CONNECT told as httpx's connect failure: nothing left the client either
+    way, but the SDK's policy retries a connect failure on any method and a ProxyError on idempotent methods alone."""
+
+    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+        self.inner = inner
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        try:
+            return await self.inner.handle_async_request(request)
+        except httpx.ProxyError as e:
+            raise httpx.ConnectError(f"the proxy did not connect: {e}", request=request) from e
+
+    async def aclose(self) -> None:
+        await self.inner.aclose()
+
+
 def pinned_transport(retry_policy: Any, ca_file: str | None, proxy: str | None) -> Any:
     """The SDK's default transport stack (an httpx.AsyncHTTPTransport, retry-wrapped as its policy wants, its
-    limits) trusting ``ca_file`` too and going through ``proxy``. Its owner closes it: the SDK leaves a transport it
-    was given alone."""
+    limits) trusting ``ca_file`` too and going through ``proxy`` (its refusals as connect failures,
+    ProxyConnectFailures). Its owner closes it: the SDK leaves a transport it was given alone."""
     import certifi
-    import httpx
     from opensandbox.transport import RetryAsyncTransport
 
     context = ssl.create_default_context(cafile=os.environ.get("SSL_CERT_FILE") or certifi.where())
@@ -220,11 +281,13 @@ def pinned_transport(retry_policy: Any, ca_file: str | None, proxy: str | None) 
         if not Path(ca_file).is_file():
             raise ValueError(f"OpenSandboxEnvironment: no CA file {ca_file} ({CA_FILE_VAR} or the ca_file kwarg)")
         context.load_verify_locations(cafile=ca_file)
-    inner = httpx.AsyncHTTPTransport(
+    inner: Any = httpx.AsyncHTTPTransport(
         verify=context,
         proxy=proxy,
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=30.0),
     )
+    if proxy:
+        inner = ProxyConnectFailures(inner)
     if retry_policy.wraps_transport():
         return RetryAsyncTransport(inner, retry_policy, owns_inner=True)
     return inner
@@ -337,12 +400,25 @@ class OpenSandboxEnvironment(HarborOpenSandboxEnvironment):
         sdk = self._load_opensandbox()
         opts = self._build_run_command_opts(sdk, cwd, self._merge_env(env), timeout_sec, user)
         timed_out = f"Command timed out after {timeout_sec} seconds"
-        started = time.monotonic()
-        run = self._sandbox.commands.run(command, opts=opts)
-        try:
-            execution = await (run if timeout_sec is None else asyncio.wait_for(run, timeout_sec + STREAM_GRACE_S))
-        except TimeoutError:
-            raise RuntimeError(timed_out) from None
+        first = time.monotonic()
+        retries = 0
+        while True:
+            started = time.monotonic()
+            run = self._sandbox.commands.run(command, opts=opts)
+            try:
+                execution = await (run if timeout_sec is None else asyncio.wait_for(run, timeout_sec + STREAM_GRACE_S))
+                break
+            except TimeoutError:
+                raise RuntimeError(timed_out) from None
+            except Exception as e:
+                # a connection that failed before the command left ran nothing: again, within the budget
+                failure = pre_send_failure(e)
+                wait = EXEC_RETRY_BACKOFF_S[min(retries, len(EXEC_RETRY_BACKOFF_S) - 1)]
+                if failure is None or time.monotonic() - first + wait > exec_retry_s():
+                    raise
+                retries += 1
+                RETRIES.note(ExecRetry(f"exec_pre_send_{type(failure).__name__}", timedelta(seconds=wait)))
+                await asyncio.sleep(wait)
         return_code = execution.exit_code
         if return_code is None:
             return_code = 1 if execution.error is not None else 0
