@@ -486,7 +486,8 @@ TAG=r2s-alfworld-qwen3.5-9b-teacher-for-qwen3.5-4b LABELS=$MILES_AGENT_DATA/r2s/
   move: `$MILES_AGENT_RESULTS/<pilot>/opd_dump`, `$MILES_AGENT_DATA/r2s/<TAG>`, `$MILES_AGENT_MODELS/<TAG>`;
   inside a run every server is `127.0.0.1`. On a scheduler every link is a dependent job of the previous one
   (`docs/cluster.md`); on one machine the steps run in sequence. One RUN_TAG per training run, never reused (it is
-  the wandb group and the save dir `$MILES_AGENT_RESULTS/<RUN_TAG>/`).
+  the wandb group and the save dir `$MILES_AGENT_RESULTS/<RUN_TAG>/`; the save dir's `wandb_run_id` file, written
+  by the first link, makes every later link resume the same wandb run).
 - A preemption or the time limit (Contract C, `docs/cluster.md`: the wrapper raises the preempt sentinel) makes
   the driver save the last trained step and the wrapper requeue or exit 75 with `JOB_STOPPED_TO_RESUME_<name>`
   for the next link; the teacher node serves through the signal (`TEACHER_SIGNAL`) and exits with

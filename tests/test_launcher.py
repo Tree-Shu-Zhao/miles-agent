@@ -259,6 +259,13 @@ def stubs():
             sys.modules[k] = v
 
 
+@pytest.fixture(autouse=True)
+def _no_wandb_key(monkeypatch):
+    # wandb args (and the save dir's wandb_run_id file) appear only where a test sets the key itself: a
+    # developer's key in the environment must not make every launch write under its save dir
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+
+
 def _run(stubs, recipe, **kw):
     mod = stubs.runs[recipe]
     mod.execute(mod.ScriptArgs(**kw))
@@ -573,6 +580,37 @@ def test_resume_logic(stubs, tmp_path):
     (critic / "latest_checkpointed_iteration.txt").write_text("10")
     cap = _run(stubs, "alfworld", save_dir=f"{save}/", algo="ppo")
     assert _flag(cap, "--load") == f"{save}/" and _flag(cap, "--critic-load") == str(critic)
+
+
+def test_wandb_run_id_persists_across_links(stubs, tmp_path, monkeypatch):
+    """Every launch of one save dir (chain links, crash restarts) passes the same --wandb-run-id, drawn once
+    and kept in <save_dir>/wandb_run_id, so wandb resumes one run; a fresh save dir gets a fresh id."""
+    monkeypatch.setenv("WANDB_API_KEY", "k")
+    save = tmp_path / "arm"
+    cap = _run(stubs, "alfworld", save_dir=f"{save}/")
+    run_id = _flag(cap, "--wandb-run-id")
+    assert re.fullmatch(r"[a-z0-9]{8}", run_id) and _flag(cap, "--wandb-group") == "arm"
+    assert (save / "wandb_run_id").read_text() == f"{run_id}\n"
+    (save / "latest_checkpointed_iteration.txt").write_text("10")
+    cap = _run(stubs, "alfworld", save_dir=f"{save}/")  # the next link: resume, same run
+    assert _flag(cap, "--load") == f"{save}/" and _flag(cap, "--wandb-run-id") == run_id
+    assert (save / "wandb_run_id").read_text() == f"{run_id}\n"
+    # a hand-written id (a run to attach to) is kept as it is
+    other = tmp_path / "arm2"
+    other.mkdir()
+    (other / "wandb_run_id").write_text("abc123xy\n")
+    assert _flag(_run(stubs, "alfworld", save_dir=f"{other}/"), "--wandb-run-id") == "abc123xy"
+    # a file that is no run id is replaced, with a warning
+    (other / "wandb_run_id").write_text("not a/run id\n")
+    drawn = _flag(_run(stubs, "alfworld", save_dir=f"{other}/"), "--wandb-run-id")
+    assert re.fullmatch(r"[a-z0-9]{8}", drawn) and (other / "wandb_run_id").read_text() == f"{drawn}\n"
+    # another save dir draws its own id
+    assert _flag(_run(stubs, "alfworld", save_dir=f"{tmp_path}/arm3/"), "--wandb-run-id") != run_id
+    # wandb off (no key): no wandb args and nothing written
+    monkeypatch.delenv("WANDB_API_KEY")
+    cap = _run(stubs, "alfworld", save_dir=f"{tmp_path}/arm4/")
+    assert "--wandb-run-id" not in _tokens(cap) and "--use-wandb" not in _tokens(cap)
+    assert not (tmp_path / "arm4").exists()
 
 
 def test_preempt_sentinel_reaches_miles(stubs):
@@ -1549,19 +1587,21 @@ def test_webshop_forwards_webshop_env_vars_only(stubs, monkeypatch):
     assert env["WANDB_CONSOLE"] == "off"
 
 
-def test_wandb_naming(stubs, monkeypatch):
+def test_wandb_naming(stubs, monkeypatch, tmp_path):
     monkeypatch.setenv("WANDB_API_KEY", "k")
-    cap = _run(stubs, "alfworld", save_dir="/r/alftrain1/")
+    cap = _run(stubs, "alfworld", save_dir=f"{tmp_path}/alftrain1/")  # writable: the launch keeps its run id there
     assert _flag(cap, "--wandb-project") == "miles-alfworld_run"
     assert _flag(cap, "--wandb-group") == "alftrain1"  # stable group = arm
-    cap = _run(stubs, "webshop", save_dir="/r/ws1/")
+    cap = _run(stubs, "webshop", save_dir=f"{tmp_path}/ws1/")
     assert _flag(cap, "--wandb-project") == "miles-webshop_run"
     assert _flag(cap, "--wandb-group") == "ws1"
-    cap = _run(stubs, "search_r1", save_dir="/r/sr1/")
+    cap = _run(stubs, "search_r1", save_dir=f"{tmp_path}/sr1/")
     assert _flag(cap, "--wandb-project") == "miles-search_r1_run"
     assert _flag(cap, "--wandb-group") == "sr1"  # stable group for every recipe
+    # no arm name in the save dir: the recipe and topology name the group (the run id is not the file's here)
+    monkeypatch.setattr(stubs.launcher, "wandb_run_id", lambda save_dir: "fixedid1")
     cap = _run(stubs, "alfworld", save_dir="/", topology="async_3n")
-    assert _flag(cap, "--wandb-group") == "alfworld_async_3n"
+    assert _flag(cap, "--wandb-group") == "alfworld_async_3n" and _flag(cap, "--wandb-run-id") == "fixedid1"
     monkeypatch.delenv("WANDB_API_KEY")
     assert "--use-wandb" not in _tokens(_run(stubs, "alfworld"))
 

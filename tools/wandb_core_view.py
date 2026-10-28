@@ -391,7 +391,8 @@ RECIPES = {
     "tmax": dict(
         project="miles-tmax_run",
         sections=tmax_sections,
-        # One curve per RUN_TAG (chain links and restarts are separate wandb runs of one group); smoke runs hidden.
+        # One curve per RUN_TAG: a run's chain links and restarts resume one wandb run (the save dir's wandb_run_id);
+        # the group view also merges the one-run-per-boot fragments of runs from before that. Smoke runs hidden.
         runset=ws.RunsetSettings(filters=[ws.Config("num_rollout") >= 20], groupby=[ws.Metric("Group")]),
     ),
 }

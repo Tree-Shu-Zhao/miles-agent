@@ -66,6 +66,7 @@ tokenizer probe. argparse is imported there only.
 import json
 import os
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -992,18 +993,56 @@ def _correction_args(args: BaseScriptArgs) -> str:
     return correction_args
 
 
+# <save_dir>/wandb_run_id: the wandb run id of the training run saved there, drawn by its first launch and read
+# back by every later one (chain links, crash restarts, requeues), so they all resume ONE wandb run.
+WANDB_RUN_ID_FILE = "wandb_run_id"
+# wandb's own id format (wandb.sdk.lib.runid.generate_id): 8 lowercase alphanumerics
+_WANDB_RUN_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
+# what wandb accepts as a run id: no whitespace and none of / \ # ? % :, at most 128 characters
+_WANDB_RUN_ID_RE = re.compile(r"[^\s/\\#?%:]{1,128}")
+
+
+def wandb_run_id(save_dir: str) -> str:
+    """The wandb run id of the training run saved under ``save_dir``.
+
+    Read from ``<save_dir>/wandb_run_id``; the first launch (no file) draws an id in wandb's own format and
+    writes the file. Every chain link and crash restart of the run then passes the same id, and miles'
+    ``--wandb-run-id`` becomes ``wandb.init(id=..., resume="allow")``: the run continues instead of opening
+    a new run under the group. The save dir is the run's identity already (its checkpoints and tracker
+    resume there), so a reused tag with a fresh save dir gets a fresh wandb run, and a hand-written id in
+    the file attaches a run to an existing wandb run (say the first link's, from before this file existed).
+    """
+    path = Path(save_dir) / WANDB_RUN_ID_FILE
+    try:
+        run_id = path.read_text().strip()
+    except FileNotFoundError:
+        run_id = ""
+    if _WANDB_RUN_ID_RE.fullmatch(run_id):
+        return run_id
+    if run_id:
+        print(f"WARN: {path} holds no wandb run id ({run_id!r}); drawing a new one", file=sys.stderr)
+    run_id = "".join(secrets.choice(_WANDB_RUN_ID_ALPHABET) for _ in range(8))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(run_id + "\n")
+    return run_id
+
+
 def wandb_args(args: LaunchArgs, spec: RecipeSpec, *, run_id: str | None = None) -> str:
     # No-op without WANDB_API_KEY in the environment. Prefix with the arm
     # name (``run_id``, else the save-dir basename): a topology-only prefix
     # makes concurrent arms indistinguishable in wandb.
     arm_name = args.save_dir.rstrip("/").rsplit("/", 1)[-1]
     run_name_prefix = run_id or arm_name or f"{spec.name}_{args.topology}"
-    # Stable group (= RUN_TAG, no per-boot timestamp; commit 1dc9ddc, extended
-    # to every recipe 2026-09-03): each chain link and crash-restart of one
-    # training run lands in the same wandb group, so the UI's group view shows
-    # one continuous curve instead of per-boot fragments. Relies on the
-    # discipline that a RUN_TAG is never reused.
-    return U.get_default_wandb_args(spec.run_file, run_id=run_name_prefix)
+    # Stable group and run name (= RUN_TAG, no per-boot timestamp, no random
+    # suffix; commit 1dc9ddc, extended to every recipe 2026-09-03) and one run
+    # id per save dir (wandb_run_id): each chain link and crash-restart of one
+    # training run resumes the same wandb run, so its charts are one continuous
+    # curve rather than per-boot fragments that only the group view merges.
+    # Relies on the discipline that a RUN_TAG, and so a save dir, is never reused.
+    base = U.get_default_wandb_args(spec.run_file, run_id=run_name_prefix)
+    if not base:
+        return ""
+    return f"{base.rstrip()} --wandb-run-id {wandb_run_id(args.save_dir)} "
 
 
 def build_train_args(args: BaseScriptArgs, spec: RecipeSpec) -> str:
